@@ -1,16 +1,19 @@
 """
-ETF NEXUS — A股场内ETF实时数据终端 Backend
-FastAPI + AKShare + Direct EastMoney HTTP API + APScheduler
+ETF NEXUS — A股全部场内ETF实时数据终端 Backend
+AKShare + FastAPI + APScheduler
+Architecture:
+  - Spot refresh: every 1min via ak.fund_etf_spot_em() → ALL ETFs
+  - Kline + stats: background thread gradually fetches for all ETFs
+  - On-demand kline: /api/kline/:code fetches live if not cached
 """
-import os, json, time, logging, math, random
+import os, json, logging, threading, time, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-import requests
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -20,123 +23,118 @@ logger = logging.getLogger("etf-nexus")
 # CONFIG
 # ============================================================
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", "1"))
-DATA_FILE = Path(__file__).parent / "etf_cache.json"
+KLINE_BATCH_SIZE = int(os.environ.get("KLINE_BATCH_SIZE", "10"))
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+SPOT_CACHE = DATA_DIR / "spot_cache.json"
+KLINE_DIR = DATA_DIR / "kline"
+KLINE_DIR.mkdir(exist_ok=True)
 
-# Target ETFs (code -> metadata)
-TARGET_ETFS = {
-    "510300": {"name": "沪深300ETF", "fee": 0.20},
-    "510500": {"name": "中证500ETF", "fee": 0.20},
-    "588000": {"name": "科创50ETF", "fee": 0.20},
-    "159915": {"name": "创业板ETF", "fee": 0.20},
-    "510050": {"name": "上证50ETF", "fee": 0.20},
-    "512100": {"name": "中证1000ETF", "fee": 0.20},
-    "513100": {"name": "纳指ETF", "fee": 0.35},
-    "159934": {"name": "黄金ETF", "fee": 0.15},
-    "512010": {"name": "医药ETF", "fee": 0.20},
-    "515030": {"name": "新能源ETF", "fee": 0.20},
-    "512660": {"name": "军工ETF", "fee": 0.20},
-    "512880": {"name": "证券ETF", "fee": 0.20},
-    "515790": {"name": "光伏ETF", "fee": 0.20},
-    "512690": {"name": "酒ETF", "fee": 0.20},
-    "159869": {"name": "游戏ETF", "fee": 0.20},
-    "512480": {"name": "半导体ETF", "fee": 0.20},
-    "513050": {"name": "中概互联ETF", "fee": 0.35},
-    "512200": {"name": "房地产ETF", "fee": 0.20},
-    "159766": {"name": "旅游ETF", "fee": 0.20},
-    "562340": {"name": "中证A50ETF", "fee": 0.15},
-    "513130": {"name": "恒生科技ETF", "fee": 0.35},
-    "518880": {"name": "金ETF", "fee": 0.15},
-    "511010": {"name": "国债ETF", "fee": 0.10},
-    "159941": {"name": "纳斯达克ETF", "fee": 0.35},
-    "510330": {"name": "华夏沪深300", "fee": 0.20},
+# ============================================================
+# IN-MEMORY STORE
+# ============================================================
+# etf_spot: { code: {name, code, currentPrice, scale, fee, chgPct, ...} }
+etf_spot = {}
+# etf_stats: { code: {dropFromHigh, riseFromLow, maxDD1Y, maxDD3Y, sparkline:[]} }
+etf_stats = {}
+# indices
+market_indices = []
+last_updated = None
+data_source = "none"
+_lock = threading.Lock()
+
+# Default fee estimation (AKShare spot doesn't include fees)
+DEFAULT_FEE = 0.20
+KNOWN_FEES = {
+    # Cross-border / QDII ETFs typically higher
+    "513100": 0.35, "513050": 0.35, "159941": 0.35, "513130": 0.35,
+    "159934": 0.15, "518880": 0.15, "511010": 0.10, "562340": 0.15,
 }
 
-# ============================================================
-# DATA STORE (in-memory, persisted to JSON)
-# ============================================================
-etf_store = {"etfs": [], "indices": [], "updated": None, "source": "none"}
-
 
 # ============================================================
-# EASTMONEY DIRECT HTTP FETCHER (primary, no AKShare dependency)
+# AKSHARE FETCHERS
 # ============================================================
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://quote.eastmoney.com/",
-}
-
-def _em_market_code(code: str) -> str:
-    """Return market prefix: 1 for SH, 0 for SZ."""
-    return "1" if code.startswith(("5", "6")) else "0"
-
-def _fetch_em_kline(code: str, days: int = 1200) -> list:
-    """Fetch daily kline from EastMoney HTTP API."""
-    mkt = _em_market_code(code)
-    end = datetime.now().strftime("%Y%m%d")
-    beg = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    url = (
-        f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
-        f"secid={mkt}.{code}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-        f"&klt=101&fqt=1&beg={beg}&end={end}&lmt=5000"
-    )
-    resp = requests.get(url, headers=_HEADERS, timeout=15)
-    data = resp.json()
-    klines_raw = data.get("data", {}).get("klines", [])
-    result = []
-    for line in klines_raw:
-        parts = line.split(",")
-        if len(parts) < 7:
+def fetch_spot_akshare():
+    """Fetch ALL ETF spot data via AKShare. Returns dict {code: row_dict}."""
+    import akshare as ak
+    logger.info("AKShare: fetching spot data for all ETFs...")
+    df = ak.fund_etf_spot_em()
+    df["代码"] = df["代码"].astype(str).str.zfill(6)
+    result = {}
+    for _, row in df.iterrows():
+        code = row["代码"]
+        try:
+            price = float(row.get("最新价", 0) or 0)
+            if price <= 0:
+                continue
+            result[code] = {
+                "code": code,
+                "name": str(row.get("名称", "")),
+                "currentPrice": round(price, 4),
+                "chgPct": round(float(row.get("涨跌幅", 0) or 0), 2),
+                "scale": round(float(row.get("总市值", 0) or 0) / 1e8, 2),
+                "volume": int(float(row.get("成交量", 0) or 0)),
+                "turnover": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                "fee": KNOWN_FEES.get(code, DEFAULT_FEE),
+            }
+        except (ValueError, TypeError):
             continue
-        result.append({
-            "date": parts[0],
-            "open": round(float(parts[1]), 4),
-            "close": round(float(parts[2]), 4),
-            "high": round(float(parts[3]), 4),
-            "low": round(float(parts[4]), 4),
-            "volume": int(float(parts[5])),
-        })
+    logger.info(f"AKShare: spot data fetched for {len(result)} ETFs")
     return result
 
-def _fetch_em_spot_all() -> dict:
-    """Fetch real-time spot data for all ETFs from EastMoney."""
-    url = (
-        "https://push2.eastmoney.com/api/qt/clist/get?"
-        "pn=1&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:MK0021,b:MK0022,b:MK0023,b:MK0024"
-        "&fields=f2,f3,f12,f14,f20"
-    )
-    resp = requests.get(url, headers=_HEADERS, timeout=15)
-    data = resp.json()
-    items = data.get("data", {}).get("diff", [])
-    spot_map = {}
-    for item in items:
-        code = str(item.get("f12", ""))
-        spot_map[code] = {
-            "price": item.get("f2"),       # 最新价
-            "chg_pct": item.get("f3"),     # 涨跌幅
-            "total_mv": item.get("f20"),   # 总市值
-            "name": item.get("f14", ""),
-        }
-    return spot_map
 
-def _fetch_em_indices() -> list:
-    """Fetch major index data."""
+def fetch_indices_akshare():
+    """Fetch major index quotes."""
+    import akshare as ak
     indices = []
-    index_codes = [("1.000001", "上证指数"), ("0.399001", "深证成指"), ("0.399006", "创业板指")]
-    for secid, name in index_codes:
+    for code, name in [("000001", "上证指数"), ("399001", "深证成指"), ("399006", "创业板指")]:
         try:
-            url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f170"
-            resp = requests.get(url, headers=_HEADERS, timeout=10)
-            d = resp.json().get("data", {})
-            val = d.get("f43", 0)
-            chg = d.get("f170", 0)
-            if val:
-                indices.append({"name": name, "val": round(val / 100, 2), "chg": round(chg / 100, 2)})
-        except Exception:
-            pass
-    return indices
+            df = ak.stock_zh_index_spot_em(symbol=code)
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                indices.append({
+                    "name": name,
+                    "val": round(float(row.get("最新价", 0)), 2),
+                    "chg": round(float(row.get("涨跌幅", 0)), 2),
+                })
+        except Exception as e:
+            logger.warning(f"Index {code} fetch failed: {e}")
+    return indices if indices else _mock_indices()
 
+
+def fetch_kline_akshare(code: str, days: int = 1200) -> list:
+    """Fetch daily kline for one ETF via AKShare."""
+    import akshare as ak
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    hist = ak.fund_etf_hist_em(
+        symbol=code, period="daily",
+        start_date=start_date, end_date=end_date, adjust="qfq"
+    )
+    if hist is None or hist.empty:
+        return []
+    kline = []
+    for _, r in hist.iterrows():
+        try:
+            kline.append({
+                "date": str(r["日期"])[:10],
+                "open": round(float(r["开盘"]), 4),
+                "close": round(float(r["收盘"]), 4),
+                "high": round(float(r["最高"]), 4),
+                "low": round(float(r["最低"]), 4),
+                "volume": int(float(r["成交量"])),
+            })
+        except (ValueError, TypeError):
+            continue
+    return kline
+
+
+# ============================================================
+# STATS COMPUTATION
+# ============================================================
 def _max_drawdown(arr):
-    if not arr:
+    if not arr or len(arr) < 2:
         return 0
     peak = arr[0]
     mdd = 0
@@ -148,81 +146,86 @@ def _max_drawdown(arr):
             mdd = dd
     return round(mdd * 100, 2)
 
-def fetch_real_data():
-    """Fetch real data via direct EastMoney HTTP API. Returns True on success."""
+
+def compute_stats(kline: list) -> dict:
+    """Compute stats from kline data."""
+    if not kline or len(kline) < 10:
+        return {}
+    closes = [k["close"] for k in kline]
+    current = closes[-1]
+    all_high = max(closes)
+    all_low = min(closes)
+    one_year = closes[-250:] if len(closes) > 250 else closes
+    three_year = closes[-750:] if len(closes) > 750 else closes
+    return {
+        "dropFromHigh": round((current - all_high) / all_high * 100, 2),
+        "riseFromLow": round((current - all_low) / all_low * 100, 2),
+        "maxDD1Y": _max_drawdown(one_year),
+        "maxDD3Y": _max_drawdown(three_year),
+        "sparkline": [round(c, 4) for c in closes[-60:]],
+    }
+
+
+# ============================================================
+# KLINE CACHE (disk-based, one file per ETF)
+# ============================================================
+def _kline_path(code: str) -> Path:
+    return KLINE_DIR / f"{code}.json"
+
+
+def save_kline(code: str, kline: list):
     try:
-        logger.info("Fetching real ETF data via EastMoney HTTP API...")
-        spot_map = _fetch_em_spot_all()
-        logger.info(f"  Spot data: {len(spot_map)} ETFs found")
-
-        etfs = []
-        for code, meta in TARGET_ETFS.items():
-            try:
-                kline = _fetch_em_kline(code)
-                if len(kline) < 10:
-                    logger.warning(f"  ✗ {code} insufficient kline data ({len(kline)} days)")
-                    continue
-
-                closes = [k["close"] for k in kline]
-                spot = spot_map.get(code, {})
-                current_price = spot.get("price") or closes[-1]
-                if isinstance(current_price, str):
-                    current_price = float(current_price)
-                total_mv = spot.get("total_mv", 0) or 0
-                scale = round(total_mv / 1e8, 2) if total_mv > 1000 else 0
-
-                all_high = max(closes)
-                all_low = min(closes)
-
-                one_year = closes[-250:] if len(closes) > 250 else closes
-                three_year = closes[-750:] if len(closes) > 750 else closes
-
-                etfs.append({
-                    "code": code,
-                    "name": meta["name"],
-                    "scale": scale,
-                    "fee": meta["fee"],
-                    "currentPrice": round(current_price, 4),
-                    "dropFromHigh": round((current_price - all_high) / all_high * 100, 2),
-                    "riseFromLow": round((current_price - all_low) / all_low * 100, 2),
-                    "maxDD1Y": _max_drawdown(one_year),
-                    "maxDD3Y": _max_drawdown(three_year),
-                    "kline": kline,
-                })
-                logger.info(f"  ✓ {code} {meta['name']} - {len(kline)} days, price={current_price}")
-            except Exception as e:
-                logger.error(f"  ✗ {code}: {e}")
-                continue
-
-        indices = _fetch_em_indices()
-        if not indices:
-            indices = _mock_indices()
-
-        if etfs:
-            global etf_store
-            etf_store = {
-                "etfs": etfs,
-                "indices": indices,
-                "updated": datetime.now().isoformat(),
-                "source": "akshare",  # keep label for frontend badge
-            }
-            _save_cache()
-            logger.info(f"Real data fetched: {len(etfs)} ETFs")
-            return True
-        return False
-
+        _kline_path(code).write_text(json.dumps(kline, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        logger.error(f"EastMoney HTTP fetch failed: {e}")
-        return False
+        logger.error(f"Save kline {code} failed: {e}")
+
+
+def load_kline(code: str) -> list:
+    p = _kline_path(code)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
 
 
 # ============================================================
-# MOCK DATA FALLBACK
+# SPOT CACHE (disk)
 # ============================================================
-def _seeded_random(seed):
-    r = random.Random(seed)
-    return r.random
+def save_spot_cache():
+    try:
+        SPOT_CACHE.write_text(json.dumps({
+            "spot": {c: s for c, s in etf_spot.items()},
+            "stats": {c: s for c, s in etf_stats.items()},
+            "indices": market_indices,
+            "updated": last_updated,
+            "source": data_source,
+        }, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Save spot cache failed: {e}")
 
+
+def load_spot_cache() -> bool:
+    global etf_spot, etf_stats, market_indices, last_updated, data_source
+    if SPOT_CACHE.exists():
+        try:
+            d = json.loads(SPOT_CACHE.read_text(encoding="utf-8"))
+            etf_spot = d.get("spot", {})
+            etf_stats = d.get("stats", {})
+            market_indices = d.get("indices", [])
+            last_updated = d.get("updated")
+            data_source = d.get("source", "cache")
+            logger.info(f"Cache loaded: {len(etf_spot)} ETFs, source={data_source}")
+            return bool(etf_spot)
+        except Exception:
+            pass
+    return False
+
+
+# ============================================================
+# MOCK FALLBACK
+# ============================================================
 def _mock_indices():
     return [
         {"name": "上证指数", "val": 3287.45, "chg": 0.82},
@@ -230,30 +233,27 @@ def _mock_indices():
         {"name": "创业板指", "val": 2089.12, "chg": 1.15},
     ]
 
-BASE_PRICES = {
-    "510300":4.1,"510500":6.8,"588000":1.05,"159915":2.6,"510050":2.9,
-    "512100":1.45,"513100":1.78,"159934":5.2,"512010":0.52,"515030":1.12,
-    "512660":1.08,"512880":0.95,"515790":0.68,"512690":1.32,"159869":0.88,
-    "512480":1.55,"513050":0.72,"512200":0.62,"159766":0.81,"562340":1.02,
-    "513130":0.68,"518880":6.1,"511010":120.5,"159941":2.35,"510330":4.85,
-}
-MOCK_SCALES = {
-    "510300":1282,"510500":685,"588000":412,"159915":356,"510050":789,
-    "512100":198,"513100":320,"159934":156,"512010":245,"515030":178,
-    "512660":267,"512880":312,"515790":89,"512690":145,"159869":56,
-    "512480":398,"513050":210,"512200":42,"159766":34,"562340":168,
-    "513130":175,"518880":220,"511010":95,"159941":88,"510330":456,
-}
+_MOCK_ETFS = [
+    ("510300","沪深300ETF",4.1,1282),("510500","中证500ETF",6.8,685),
+    ("588000","科创50ETF",1.05,412),("159915","创业板ETF",2.6,356),
+    ("510050","上证50ETF",2.9,789),("512100","中证1000ETF",1.45,198),
+    ("513100","纳指ETF",1.78,320),("159934","黄金ETF",5.2,156),
+    ("512010","医药ETF",0.52,245),("515030","新能源ETF",1.12,178),
+    ("512660","军工ETF",1.08,267),("512880","证券ETF",0.95,312),
+    ("515790","光伏ETF",0.68,89),("512690","酒ETF",1.32,145),
+    ("159869","游戏ETF",0.88,56),("512480","半导体ETF",1.55,398),
+    ("513050","中概互联ETF",0.72,210),("512200","房地产ETF",0.62,42),
+    ("159766","旅游ETF",0.81,34),("562340","中证A50ETF",1.02,168),
+    ("513130","恒生科技ETF",0.68,175),("518880","金ETF",6.1,220),
+    ("511010","国债ETF",120.5,95),("159941","纳斯达克ETF",2.35,88),
+    ("510330","华夏沪深300",4.85,456),
+]
 
-def generate_mock_data():
-    """Generate realistic mock data as fallback."""
-    global etf_store
-    logger.info("Generating mock data fallback...")
-    etfs = []
-    for code, meta in TARGET_ETFS.items():
+def generate_mock():
+    global etf_spot, etf_stats, market_indices, last_updated, data_source
+    logger.info("Generating mock data...")
+    for code, name, base, scale in _MOCK_ETFS:
         rand = random.Random(int(code) + 42)
-        base = BASE_PRICES.get(code, 1.0)
-        scale = MOCK_SCALES.get(code, 100)
         price = base * (0.6 + rand.random() * 0.5)
         kline = []
         d = datetime(2023, 1, 3)
@@ -263,84 +263,89 @@ def generate_mock_data():
             vol = 0.015 + rand.random() * 0.02
             drift = (rand.random() - 0.48) * 0.003
             change = price * (drift + vol * (rand.random() - 0.5) * 2)
-            op = price
-            cl = max(0.01, price + change)
+            op = price; cl = max(0.01, price + change)
             hi = max(op, cl) * (1 + rand.random() * 0.008)
             lo = min(op, cl) * (1 - rand.random() * 0.008)
             volume = int((50 + rand.random() * 200) * scale * 0.1)
-            kline.append({
-                "date": d.strftime("%Y-%m-%d"),
+            kline.append({"date": d.strftime("%Y-%m-%d"),
                 "open": round(op, 4), "close": round(cl, 4),
-                "high": round(hi, 4), "low": round(lo, 4),
-                "volume": volume,
-            })
-            price = cl
-            d += timedelta(days=1)
-
-        closes = [k["close"] for k in kline]
-        current = closes[-1]
-        ah = max(closes); al = min(closes)
-        def mdd(arr):
-            pk = arr[0]; md = 0
-            for v in arr:
-                if v > pk: pk = v
-                dd = (v - pk) / pk
-                if dd < md: md = dd
-            return round(md * 100, 2)
-
-        etfs.append({
-            "code": code, "name": meta["name"], "scale": scale, "fee": meta["fee"],
-            "currentPrice": round(current, 4),
-            "dropFromHigh": round((current - ah) / ah * 100, 2),
-            "riseFromLow": round((current - al) / al * 100, 2),
-            "maxDD1Y": mdd(closes[-250:] if len(closes) > 250 else closes),
-            "maxDD3Y": mdd(closes[-750:] if len(closes) > 750 else closes),
-            "kline": kline,
-        })
-
-    etf_store = {
-        "etfs": etfs,
-        "indices": _mock_indices(),
-        "updated": datetime.now().isoformat(),
-        "source": "mock",
-    }
-    _save_cache()
-    logger.info(f"Mock data generated: {len(etfs)} ETFs")
+                "high": round(hi, 4), "low": round(lo, 4), "volume": volume})
+            price = cl; d += timedelta(days=1)
+        save_kline(code, kline)
+        stats = compute_stats(kline)
+        etf_spot[code] = {
+            "code": code, "name": name, "currentPrice": round(price, 4),
+            "scale": scale, "fee": KNOWN_FEES.get(code, DEFAULT_FEE),
+            "chgPct": round((rand.random() - 0.5) * 4, 2), "volume": 0, "turnover": 0,
+        }
+        etf_stats[code] = stats
+    market_indices = _mock_indices()
+    last_updated = datetime.now().isoformat()
+    data_source = "mock"
+    save_spot_cache()
+    logger.info(f"Mock data: {len(etf_spot)} ETFs")
 
 
 # ============================================================
-# CACHE PERSISTENCE
+# REFRESH JOBS
 # ============================================================
-def _save_cache():
+def refresh_spot():
+    """Fast refresh: spot data + indices for ALL ETFs. Runs every 1 min."""
+    global etf_spot, market_indices, last_updated, data_source
     try:
-        DATA_FILE.write_text(json.dumps(etf_store, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        logger.error(f"Save cache failed: {e}")
-
-def _load_cache():
-    global etf_store
-    if DATA_FILE.exists():
+        new_spot = fetch_spot_akshare()
+        if not new_spot:
+            logger.warning("Spot refresh returned empty, keeping cached data")
+            return
+        with _lock:
+            # Merge: update existing, add new
+            for code, info in new_spot.items():
+                if code in etf_spot:
+                    etf_spot[code].update(info)
+                else:
+                    etf_spot[code] = info
+            # Remove delisted (not in new spot)
+            for code in list(etf_spot.keys()):
+                if code not in new_spot and data_source != "mock":
+                    del etf_spot[code]
         try:
-            etf_store = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            logger.info(f"Cache loaded: {len(etf_store.get('etfs',[]))} ETFs, source={etf_store.get('source')}")
-            return True
+            indices = fetch_indices_akshare()
+            if indices:
+                market_indices = indices
         except Exception:
             pass
-    return False
+        last_updated = datetime.now().isoformat()
+        data_source = "live"
+        save_spot_cache()
+        logger.info(f"Spot refreshed: {len(etf_spot)} ETFs")
+    except Exception as e:
+        logger.error(f"Spot refresh failed: {e}")
 
 
-# ============================================================
-# SCHEDULER JOB
-# ============================================================
-def refresh_job():
-    """Called by scheduler every N minutes."""
-    logger.info(f"Scheduled refresh triggered (interval={REFRESH_MINUTES}min)")
-    if not fetch_real_data():
-        # Only generate mock if we have NO data at all
-        if not etf_store.get("etfs"):
-            generate_mock_data()
-        else:
-            logger.info("AKShare failed but cached data still valid, skipping mock regeneration")
+def refresh_kline_batch():
+    """Slow background: fetch kline + compute stats in batches."""
+    global etf_stats
+    codes = list(etf_spot.keys())
+    random.shuffle(codes)  # Randomize to spread load
+    total = len(codes)
+    done = 0
+    for i in range(0, total, KLINE_BATCH_SIZE):
+        batch = codes[i:i + KLINE_BATCH_SIZE]
+        for code in batch:
+            try:
+                kline = fetch_kline_akshare(code)
+                if kline and len(kline) >= 10:
+                    save_kline(code, kline)
+                    stats = compute_stats(kline)
+                    with _lock:
+                        etf_stats[code] = stats
+                    done += 1
+            except Exception as e:
+                logger.error(f"Kline {code}: {e}")
+        logger.info(f"Kline batch progress: {min(i + KLINE_BATCH_SIZE, total)}/{total}")
+        time.sleep(0.5)  # Rate limit
+    save_spot_cache()
+    logger.info(f"Kline refresh complete: {done}/{total} updated")
 
 
 # ============================================================
@@ -350,61 +355,92 @@ scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    loaded = _load_cache()
+    loaded = load_spot_cache()
     if not loaded:
-        if not fetch_real_data():
-            generate_mock_data()
-    # Schedule periodic refresh
-    scheduler.add_job(refresh_job, "interval", minutes=REFRESH_MINUTES, id="etf_refresh",
-                      max_instances=1, coalesce=True)
+        try:
+            refresh_spot()
+        except Exception:
+            pass
+        if not etf_spot:
+            generate_mock()
+    # Spot refresh every N minutes
+    scheduler.add_job(refresh_spot, "interval", minutes=REFRESH_MINUTES,
+                      id="spot_refresh", max_instances=1, coalesce=True)
+    # Kline refresh every 30 minutes (background, slow)
+    scheduler.add_job(refresh_kline_batch, "interval", minutes=30,
+                      id="kline_refresh", max_instances=1, coalesce=True)
     scheduler.start()
-    logger.info(f"Scheduler started: refresh every {REFRESH_MINUTES} minute(s)")
+    logger.info(f"Scheduler started: spot every {REFRESH_MINUTES}min, kline every 30min")
+    # Trigger initial kline fetch in background thread
+    threading.Thread(target=refresh_kline_batch, daemon=True).start()
     yield
-    # Shutdown
     scheduler.shutdown(wait=False)
 
 app = FastAPI(title="ETF NEXUS", lifespan=lifespan)
 
+
 @app.get("/api/etf-data")
 async def get_etf_data():
-    """Return all ETF data (without kline to keep payload small)."""
-    etfs_slim = []
-    for e in etf_store.get("etfs", []):
-        slim = {k: v for k, v in e.items() if k != "kline"}
-        # Include last 60 closes for sparkline
-        kline = e.get("kline", [])
-        slim["sparkline"] = [k["close"] for k in kline[-60:]]
-        etfs_slim.append(slim)
+    """Return all ETF data (spot + stats, no full kline)."""
+    with _lock:
+        etfs = []
+        for code, spot in etf_spot.items():
+            entry = {**spot}
+            stats = etf_stats.get(code, {})
+            entry["dropFromHigh"] = stats.get("dropFromHigh", None)
+            entry["riseFromLow"] = stats.get("riseFromLow", None)
+            entry["maxDD1Y"] = stats.get("maxDD1Y", None)
+            entry["maxDD3Y"] = stats.get("maxDD3Y", None)
+            entry["sparkline"] = stats.get("sparkline", [])
+            etfs.append(entry)
     return JSONResponse({
-        "etfs": etfs_slim,
-        "indices": etf_store.get("indices", []),
-        "updated": etf_store.get("updated"),
-        "source": etf_store.get("source"),
+        "etfs": etfs,
+        "indices": market_indices,
+        "updated": last_updated,
+        "source": data_source,
     })
+
 
 @app.get("/api/kline/{code}")
 async def get_kline(code: str, range: str = "1Y"):
-    """Return full kline data for a specific ETF."""
-    etf = next((e for e in etf_store.get("etfs", []) if e["code"] == code), None)
-    if not etf:
-        return JSONResponse({"error": "ETF not found"}, status_code=404)
+    """Return kline data. Tries cache first, then fetches live."""
+    kline = load_kline(code)
+    if not kline:
+        # Try fetching live
+        try:
+            kline = fetch_kline_akshare(code)
+            if kline:
+                save_kline(code, kline)
+                stats = compute_stats(kline)
+                with _lock:
+                    etf_stats[code] = stats
+        except Exception as e:
+            logger.error(f"On-demand kline {code}: {e}")
+    if not kline:
+        return JSONResponse({"error": "Kline data not available"}, status_code=404)
     range_map = {"1M": 22, "3M": 66, "6M": 132, "1Y": 250, "3Y": 750, "全部": 999999}
     n = range_map.get(range, 250)
-    kline = etf["kline"][-min(n, len(etf["kline"])):]
+    sliced = kline[-min(n, len(kline)):]
+    spot = etf_spot.get(code, {})
     return JSONResponse({
         "code": code,
-        "name": etf["name"],
-        "fee": etf["fee"],
-        "scale": etf["scale"],
-        "kline": kline,
+        "name": spot.get("name", code),
+        "fee": spot.get("fee", DEFAULT_FEE),
+        "scale": spot.get("scale", 0),
+        "kline": sliced,
     })
+
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "etf_count": len(etf_store.get("etfs", [])),
-            "source": etf_store.get("source"), "updated": etf_store.get("updated"),
-            "refresh_minutes": REFRESH_MINUTES}
+    return {
+        "status": "ok",
+        "etf_count": len(etf_spot),
+        "stats_count": len(etf_stats),
+        "source": data_source,
+        "updated": last_updated,
+        "refresh_minutes": REFRESH_MINUTES,
+    }
 
 # Serve static files
 static_dir = Path(__file__).parent / "static"

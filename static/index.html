@@ -171,7 +171,7 @@ async function fetchData() {
     renderMarketTicker(json.indices || [], json.updated);
     // Update source badge
     const badge = document.getElementById('sourceBadge');
-    if (dataSource === 'akshare') {
+    if (dataSource === 'akshare' || dataSource === 'live') {
       badge.textContent = 'LIVE'; badge.className = 'source-badge source-live';
     } else {
       badge.textContent = 'DEMO'; badge.className = 'source-badge source-mock';
@@ -240,8 +240,8 @@ function getFilteredSorted() {
   }
   for (const key of FILTER_KEYS) {
     const f = state.filters[key]; if(!f) continue;
-    if(f.min!=null) data=data.filter(d=>d[key]>=f.min);
-    if(f.max!=null) data=data.filter(d=>d[key]<=f.max);
+    if(f.min!=null) data=data.filter(d=>d[key]!=null&&d[key]>=f.min);
+    if(f.max!=null) data=data.filter(d=>d[key]!=null&&d[key]<=f.max);
   }
   if (state.sortKey) {
     data.sort((a,b)=>{
@@ -285,14 +285,14 @@ function renderTable() {
     return `<tr class="animate-slide-in" style="animation-delay:${Math.min(i*20,400)}ms" data-code="${etf.code}">
       <td class="text-white font-body font-medium text-sm">${etf.name}</td>
       <td class="text-gray-500">${etf.code}</td>
-      <td>${Number(etf.scale).toLocaleString()}</td>
+      <td>${Number(etf.scale||0).toLocaleString()}</td>
       <td class="${priceColor} font-bold">${Number(etf.currentPrice).toFixed(3)}</td>
-      <td class="text-gray-400">${Number(etf.fee).toFixed(2)}</td>
+      <td class="text-gray-400">${Number(etf.fee||0).toFixed(2)}</td>
       <td><div class="sparkline-container" id="spark-${etf.code}"></div></td>
-      <td class="text-green-400">${Number(etf.dropFromHigh).toFixed(2)}</td>
-      <td class="text-red-400">+${Number(etf.riseFromLow).toFixed(2)}</td>
-      <td class="text-yellow-400">${Number(etf.maxDD1Y).toFixed(2)}</td>
-      <td class="text-orange-400">${Number(etf.maxDD3Y).toFixed(2)}</td>
+      <td class="text-green-400">${etf.dropFromHigh!=null?Number(etf.dropFromHigh).toFixed(2):'—'}</td>
+      <td class="text-red-400">${etf.riseFromLow!=null?'+'+Number(etf.riseFromLow).toFixed(2):'—'}</td>
+      <td class="text-yellow-400">${etf.maxDD1Y!=null?Number(etf.maxDD1Y).toFixed(2):'—'}</td>
+      <td class="text-orange-400">${etf.maxDD3Y!=null?Number(etf.maxDD3Y).toFixed(2):'—'}</td>
     </tr>`;
   }).join('');
   renderTableHead();
