@@ -20,6 +20,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("etf-nexus")
 
 # ============================================================
+# PROXY CONFIG — route AKShare (requests/urllib) through a China proxy
+# Set env var AKSHARE_PROXY to e.g. "http://your-cn-proxy:8080"
+# or use standard HTTP_PROXY / HTTPS_PROXY vars.
+# ============================================================
+_PROXY = os.environ.get("AKSHARE_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+if _PROXY:
+    os.environ.setdefault("HTTP_PROXY", _PROXY)
+    os.environ.setdefault("HTTPS_PROXY", _PROXY)
+    logger.info(f"Proxy configured: {_PROXY}")
+else:
+    logger.info("No proxy configured — AKShare will connect directly")
+
+# ============================================================
 # CONFIG
 # ============================================================
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", "1"))
@@ -440,7 +453,22 @@ async def health():
         "source": data_source,
         "updated": last_updated,
         "refresh_minutes": REFRESH_MINUTES,
+        "proxy": _PROXY or "none",
     }
+
+
+@app.get("/api/diag")
+async def diag():
+    """Quick diagnostic: try one AKShare call and report result."""
+    result = {"proxy": _PROXY or "none", "akshare_ok": False, "error": None, "etf_count": 0}
+    try:
+        import akshare as ak
+        df = ak.fund_etf_spot_em()
+        result["akshare_ok"] = True
+        result["etf_count"] = len(df)
+    except Exception as e:
+        result["error"] = str(e)[:500]
+    return result
 
 # Serve static files
 static_dir = Path(__file__).parent / "static"
