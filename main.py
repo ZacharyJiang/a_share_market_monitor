@@ -7,7 +7,9 @@ Architecture:
   - On-demand kline: /api/kline/:code fetches live if not cached
 """
 import os, json, logging, threading, time, random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+BEIJING_TZ = timezone(timedelta(hours=8))
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -58,11 +60,98 @@ _lock = threading.Lock()
 
 # Default fee estimation (AKShare spot doesn't include fees)
 DEFAULT_FEE = 0.20
-KNOWN_FEES = {
-    # Cross-border / QDII ETFs typically higher
-    "513100": 0.35, "513050": 0.35, "159941": 0.35, "513130": 0.35,
-    "159934": 0.15, "518880": 0.15, "511010": 0.10, "562340": 0.15,
-}
+KNOWN_FEES = {}
+
+# ============================================================
+# FEE DETAIL SYSTEM — fetch real fees from eastmoney, cache on disk
+# ============================================================
+FEE_CACHE_FILE = DATA_DIR / "fee_cache.json"
+_fee_cache = {}  # {code: {"管理费": x, "托管费": y}}
+
+
+def _load_fee_cache():
+    global _fee_cache
+    if FEE_CACHE_FILE.exists():
+        try:
+            _fee_cache = json.loads(FEE_CACHE_FILE.read_text(encoding="utf-8"))
+            logger.info(f"Fee cache loaded: {len(_fee_cache)} ETFs")
+        except Exception:
+            _fee_cache = {}
+
+
+def _save_fee_cache():
+    try:
+        FEE_CACHE_FILE.write_text(json.dumps(_fee_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Save fee cache failed: {e}")
+
+
+def _fetch_fee_from_eastmoney(code: str) -> dict | None:
+    """Scrape real management/custody fee from eastmoney fund page."""
+    import requests, re
+    url = f"http://fundf10.eastmoney.com/jbgk_{code}.html"
+    try:
+        resp = requests.get(url, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        if resp.status_code != 200:
+            return None
+        text = resp.text
+        result = {}
+        m = re.search(r"管理费率[^%]*?(\d+\.\d+)%", text)
+        if m:
+            result["管理费"] = float(m.group(1))
+        m = re.search(r"托管费率[^%]*?(\d+\.\d+)%", text)
+        if m:
+            result["托管费"] = float(m.group(1))
+        return result if result else None
+    except Exception:
+        return None
+
+
+def refresh_fee_batch(codes: list):
+    """Fetch real fee data for ETFs not yet cached. Runs in background."""
+    global _fee_cache
+    to_fetch = [c for c in codes if c not in _fee_cache]
+    if not to_fetch:
+        logger.info("Fee cache already complete, nothing to fetch")
+        return
+    logger.info(f"Fee refresh: {len(to_fetch)} ETFs to fetch ({len(_fee_cache)} cached)")
+    done = 0
+    for i, code in enumerate(to_fetch):
+        try:
+            fees = _fetch_fee_from_eastmoney(code)
+            if fees:
+                _fee_cache[code] = fees
+                done += 1
+        except Exception:
+            pass
+        if (i + 1) % 50 == 0:
+            logger.info(f"Fee progress: {i + 1}/{len(to_fetch)} (found {done})")
+            _save_fee_cache()
+            time.sleep(0.2)  # Rate limit
+        elif (i + 1) % 5 == 0:
+            time.sleep(0.1)
+    _save_fee_cache()
+    logger.info(f"Fee refresh complete: {done}/{len(to_fetch)} fetched, total cached: {len(_fee_cache)}")
+
+
+def get_fee_detail(code: str, name: str = "") -> dict:
+    """Return fee breakdown dict for an ETF from cache."""
+    if code in _fee_cache:
+        return _fee_cache[code]
+    # Fallback: return empty (will show as "—")
+    return {}
+
+
+def format_fee_detail(detail: dict) -> str:
+    """Format fee detail dict to display string."""
+    if not detail:
+        return ""
+    parts = []
+    for k, v in detail.items():
+        parts.append(f"{k}{v:.2f}%")
+    return ", ".join(parts)
 
 
 # ============================================================
@@ -103,9 +192,11 @@ def fetch_spot_akshare():
     col_high = _find_col(["最高价", "最高"], cols)
     col_low = _find_col(["最低价", "最低"], cols)
     col_prev = _find_col(["昨收", "昨收价"], cols)
+    col_iopv = _find_col(["IOPV实时估值", "IOPV", "估值"], cols)
+    col_shares = _find_col(["最新份额", "份额"], cols)
 
     logger.info(f"Column mapping: price={col_price}, name={col_name}, chg={col_chg}, "
-                f"vol={col_vol}, amt={col_amt}, scale={col_scale}")
+                f"vol={col_vol}, amt={col_amt}, scale={col_scale}, iopv={col_iopv}, shares={col_shares}")
 
     result = {}
     for _, row in df.iterrows():
@@ -114,26 +205,35 @@ def fetch_spot_akshare():
             price = _safe_float(row.get(col_price) if col_price else None)
             if price <= 0:
                 continue
-            # Scale: try 总市值 first, else estimate from 成交额/换手率 if available
-            scale_raw = _safe_float(row.get(col_scale) if col_scale else None)
-            if scale_raw > 1e6:  # Likely in yuan, convert to 亿
-                scale = round(scale_raw / 1e8, 2)
-            elif scale_raw > 0:  # Might already be in 亿
-                scale = round(scale_raw, 2)
+            # Scale: prefer 最新份额 × IOPV (= actual fund NAV), fallback to 总市值
+            iopv = _safe_float(row.get(col_iopv) if col_iopv else None)
+            shares = _safe_float(row.get(col_shares) if col_shares else None)
+            if iopv > 0 and shares > 0:
+                scale = round(iopv * shares / 1e8, 2)
             else:
-                # Estimate: daily turnover / turnover_rate ≈ total market cap
-                amt = _safe_float(row.get(col_amt) if col_amt else None)
-                scale = round(amt / 1e8, 2) if amt > 0 else 0
+                scale_raw = _safe_float(row.get(col_scale) if col_scale else None)
+                if scale_raw > 1e6:  # Likely in yuan, convert to 亿
+                    scale = round(scale_raw / 1e8, 2)
+                elif scale_raw > 0:
+                    scale = round(scale_raw, 2)
+                else:
+                    amt = _safe_float(row.get(col_amt) if col_amt else None)
+                    scale = round(amt / 1e8, 2) if amt > 0 else 0
+
+            name_str = str(row.get(col_name, "") if col_name else "")
+            fee_detail = get_fee_detail(code, name_str)
+            fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
             result[code] = {
                 "code": code,
-                "name": str(row.get(col_name, "") if col_name else ""),
+                "name": name_str,
                 "currentPrice": round(price, 4),
                 "chgPct": round(_safe_float(row.get(col_chg) if col_chg else None), 2),
                 "scale": scale,
                 "volume": int(_safe_float(row.get(col_vol) if col_vol else None)),
                 "turnover": round(_safe_float(row.get(col_amt) if col_amt else None) / 1e8, 2),
-                "fee": KNOWN_FEES.get(code, DEFAULT_FEE),
+                "fee": fee_total,
+                "feeDetail": format_fee_detail(fee_detail),
                 "open": round(_safe_float(row.get(col_open) if col_open else None), 4),
                 "high": round(_safe_float(row.get(col_high) if col_high else None), 4),
                 "low": round(_safe_float(row.get(col_low) if col_low else None), 4),
@@ -149,10 +249,11 @@ def fetch_spot_akshare():
 def fetch_indices_akshare():
     """Fetch major index quotes via multiple AKShare APIs (fallback chain)."""
     import akshare as ak
-    target = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
+    target = {"000001": "上证指数", "399001": "深证成指", "000300": "沪深300"}
     indices = []
 
-    # Method 1: stock_zh_index_spot_em (all indices in one call)
+    # Method 1: stock_zh_index_spot_em — try to get all from one call
+    method1_map = {}
     try:
         df = ak.stock_zh_index_spot_em()
         if df is not None and not df.empty:
@@ -167,35 +268,43 @@ def fetch_indices_akshare():
                     match = df[df[col_code] == code]
                     if not match.empty:
                         row = match.iloc[0]
-                        indices.append({
+                        method1_map[code] = {
                             "name": name,
                             "val": round(_safe_float(row.get(col_price)), 2),
                             "chg": round(_safe_float(row.get(col_chg) if col_chg else None), 2),
-                        })
-        if indices:
-            logger.info(f"Indices fetched (method1): {len(indices)}")
-            return indices
+                        }
+            logger.info(f"Method1 found {len(method1_map)}/{len(target)} indices")
     except Exception as e:
         logger.warning(f"Index method1 (stock_zh_index_spot_em) failed: {e}")
 
-    # Method 2: Use index daily kline for latest close
-    for code, name in target.items():
-        try:
-            sym = f"sh{code}" if code.startswith("0") else f"sz{code}"
-            df = ak.stock_zh_index_daily(symbol=sym)
-            if df is not None and not df.empty:
-                last = df.iloc[-1]
-                close_col = next((c for c in ["close", "收盘"] if c in df.columns), df.columns[3] if len(df.columns) > 3 else None)
-                if close_col:
-                    close = _safe_float(last.get(close_col))
-                    prev = _safe_float(df.iloc[-2].get(close_col)) if len(df) > 1 else close
-                    chg = round((close - prev) / prev * 100, 2) if prev > 0 else 0
-                    indices.append({"name": name, "val": round(close, 2), "chg": chg})
-        except Exception as e:
-            logger.warning(f"Index method2 ({code}) failed: {e}")
+    # Method 2: Use index daily kline for any missing indices
+    missing = {c: n for c, n in target.items() if c not in method1_map}
+    method2_map = {}
+    if missing:
+        for code, name in missing.items():
+            try:
+                sym = f"sh{code}" if code.startswith("000") else f"sz{code}"
+                df = ak.stock_zh_index_daily(symbol=sym)
+                if df is not None and not df.empty:
+                    last = df.iloc[-1]
+                    close_col = next((c for c in ["close", "收盘"] if c in df.columns), df.columns[3] if len(df.columns) > 3 else None)
+                    if close_col:
+                        close = _safe_float(last.get(close_col))
+                        prev = _safe_float(df.iloc[-2].get(close_col)) if len(df) > 1 else close
+                        chg = round((close - prev) / prev * 100, 2) if prev > 0 else 0
+                        method2_map[code] = {"name": name, "val": round(close, 2), "chg": chg}
+            except Exception as e:
+                logger.warning(f"Index method2 ({code}) failed: {e}")
+        logger.info(f"Method2 filled {len(method2_map)}/{len(missing)} missing indices")
+
+    # Combine: method1 + method2, in target order
+    combined = {**method1_map, **method2_map}
+    for code in target:
+        if code in combined:
+            indices.append(combined[code])
 
     if indices:
-        logger.info(f"Indices fetched (method2): {len(indices)}")
+        logger.info(f"Indices fetched: {len(indices)} total")
         return indices
 
     # Method 3: Extract from ETF spot data (approximate from 510050/沪深300 etc.)
@@ -337,7 +446,7 @@ def _mock_indices():
     return [
         {"name": "上证指数", "val": 3287.45, "chg": 0.82},
         {"name": "深证成指", "val": 10456.78, "chg": -0.35},
-        {"name": "创业板指", "val": 2089.12, "chg": 1.15},
+        {"name": "沪深300", "val": 3850.00, "chg": 0.45},
     ]
 
 _MOCK_ETFS = [
@@ -380,14 +489,18 @@ def generate_mock():
             price = cl; d += timedelta(days=1)
         save_kline(code, kline)
         stats = compute_stats(kline)
+        fee_detail = get_fee_detail(code, name)
+        fee_total = round(sum(fee_detail.values()), 2)
         etf_spot[code] = {
             "code": code, "name": name, "currentPrice": round(price, 4),
-            "scale": scale, "fee": KNOWN_FEES.get(code, DEFAULT_FEE),
+            "scale": scale, "fee": fee_total,
+            "feeDetail": format_fee_detail(fee_detail),
+            "pe": round(10 + rand.random() * 30, 2),
             "chgPct": round((rand.random() - 0.5) * 4, 2), "volume": 0, "turnover": 0,
         }
         etf_stats[code] = stats
     market_indices = _mock_indices()
-    last_updated = datetime.now().isoformat()
+    last_updated = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
     data_source = "mock"
     save_spot_cache()
     logger.info(f"Mock data: {len(etf_spot)} ETFs")
@@ -421,7 +534,7 @@ def refresh_spot():
                 market_indices = indices
         except Exception:
             pass
-        last_updated = datetime.now().isoformat()
+        last_updated = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
         data_source = "live"
         save_spot_cache()
         logger.info(f"Spot refreshed: {len(etf_spot)} ETFs")
@@ -462,6 +575,7 @@ scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_fee_cache()
     loaded = load_spot_cache()
     # Always try a live refresh at startup, even if cache was loaded
     # This ensures we don't stay stuck on mock data forever
@@ -479,10 +593,15 @@ async def lifespan(app: FastAPI):
     # Kline refresh every 30 minutes (background, slow)
     scheduler.add_job(refresh_kline_batch, "interval", minutes=30,
                       id="kline_refresh", max_instances=1, coalesce=True)
+    # Fee refresh daily (fees rarely change)
+    scheduler.add_job(lambda: refresh_fee_batch(list(etf_spot.keys())),
+                      "interval", hours=24, id="fee_refresh", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info(f"Scheduler started: spot every {REFRESH_MINUTES}min, kline every 30min")
     # Trigger initial kline fetch in background thread
     threading.Thread(target=refresh_kline_batch, daemon=True).start()
+    # Trigger fee fetch in background thread (only fetches uncached)
+    threading.Thread(target=lambda: refresh_fee_batch(list(etf_spot.keys())), daemon=True).start()
     yield
     scheduler.shutdown(wait=False)
 
@@ -502,6 +621,12 @@ async def get_etf_data():
             entry["maxDD1Y"] = stats.get("maxDD1Y", None)
             entry["maxDD3Y"] = stats.get("maxDD3Y", None)
             entry["sparkline"] = stats.get("sparkline", [])
+            # Re-compute fee from live cache (in case fee data was fetched after spot)
+            fee_detail = get_fee_detail(code)
+            if fee_detail:
+                entry["fee"] = round(sum(fee_detail.values()), 2)
+                entry["feeDetail"] = format_fee_detail(fee_detail)
+            entry.setdefault("feeDetail", "")
             etfs.append(entry)
     return JSONResponse({
         "etfs": etfs,

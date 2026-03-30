@@ -116,10 +116,12 @@ body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;backgr
         <tbody id="tableBody"></tbody>
       </table>
     </div>
+    <!-- PAGINATION -->
+    <div id="pagination" class="flex items-center justify-between px-4 py-3 border-t border-cyan-900/10">
+      <span class="text-xs text-gray-500 font-mono" id="pageInfo"></span>
+      <div class="flex items-center gap-1" id="pageButtons"></div>
+    </div>
   </section>
-</div>
-
-<!-- K-LINE MODAL -->
 <div class="modal-overlay" id="klineModal">
   <div class="modal-content">
     <div class="flex items-center justify-between p-4 border-b border-cyan-900/20">
@@ -143,13 +145,16 @@ body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;backgr
 // ============================================================
 let ETF_DATA = [];
 let dataSource = 'loading';
-const state = { sortKey:'scale', sortDir:'desc', search:'', filters:{}, modalETF:null, modalRange:'1Y' };
+const state = { sortKey:'scale', sortDir:'desc', search:'', filters:{}, modalETF:null, modalRange:'1Y', page:1 };
+const PAGE_SIZE = 50;
 const COLUMNS = [
-  {key:'name',label:'ETF名称',sortable:false,filterable:false},
-  {key:'code',label:'代码',sortable:false,filterable:false},
+  {key:'name',label:'ETF名称',sortable:true,filterable:false},
+  {key:'code',label:'代码',sortable:true,filterable:false},
   {key:'scale',label:'规模(亿)',sortable:true,filterable:true},
   {key:'currentPrice',label:'现价',sortable:true,filterable:true},
-  {key:'fee',label:'费率%',sortable:true,filterable:true},
+  {key:'chgPct',label:'涨跌幅%',sortable:true,filterable:true},
+  {key:'fee',label:'总费率%',sortable:true,filterable:true},
+  {key:'feeDetail',label:'费用明细',sortable:false,filterable:false},
   {key:'sparkline',label:'K线',sortable:false,filterable:false},
   {key:'dropFromHigh',label:'离最高跌幅%',sortable:true,filterable:true},
   {key:'riseFromLow',label:'离最低涨幅%',sortable:true,filterable:true},
@@ -203,7 +208,7 @@ function renderMarketTicker(indices, updated) {
       <span class="text-xs font-mono font-bold ${color}">${arrow} ${Math.abs(idx.chg)}%</span>
     </div>`;
   }).join('');
-  document.getElementById('updateTime').textContent = updated ? '更新: ' + new Date(updated).toLocaleString('zh-CN') : '';
+  document.getElementById('updateTime').textContent = updated ? '更新: ' + updated + ' (北京时间)' : '';
 }
 
 // ============================================================
@@ -224,7 +229,7 @@ function renderFilterPanel() {
       const key=inp.dataset.filter, bound=inp.dataset.bound;
       if(!state.filters[key]) state.filters[key]={};
       state.filters[key][bound] = inp.value==='' ? null : parseFloat(inp.value);
-      renderTable();
+      state.page=1; renderTable();
     });
   });
 }
@@ -246,7 +251,11 @@ function getFilteredSorted() {
   if (state.sortKey) {
     data.sort((a,b)=>{
       let va=a[state.sortKey],vb=b[state.sortKey];
-      if(typeof va==='string'){va=va.toLowerCase();vb=vb.toLowerCase();}
+      // Nulls go to the end
+      if(va==null && vb==null) return 0;
+      if(va==null) return 1;
+      if(vb==null) return -1;
+      if(typeof va==='string'){va=va.toLowerCase();vb=(vb||'').toLowerCase();}
       if(va<vb) return state.sortDir==='asc'?-1:1;
       if(va>vb) return state.sortDir==='asc'?1:-1;
       return 0;
@@ -267,7 +276,7 @@ function renderTableHead() {
       const key=th.dataset.key;
       if(state.sortKey===key) state.sortDir=state.sortDir==='asc'?'desc':'asc';
       else{state.sortKey=key;state.sortDir='desc';}
-      renderTable();
+      state.page=1; renderTable();
     });
   });
 }
@@ -275,19 +284,28 @@ function renderTableHead() {
 let sparkCharts={};
 function renderTable() {
   Object.values(sparkCharts).forEach(c=>c.dispose()); sparkCharts={};
-  const data = getFilteredSorted();
-  document.getElementById('statsInfo').textContent=`${data.length} / ${ETF_DATA.length} 支ETF`;
+  const allData = getFilteredSorted();
+  const totalPages = Math.max(1, Math.ceil(allData.length / PAGE_SIZE));
+  if (state.page > totalPages) state.page = totalPages;
+  if (state.page < 1) state.page = 1;
+  const start = (state.page - 1) * PAGE_SIZE;
+  const data = allData.slice(start, start + PAGE_SIZE);
+  document.getElementById('statsInfo').textContent=`${allData.length} / ${ETF_DATA.length} 支ETF`;
   const tbody = document.getElementById('tableBody');
   tbody.innerHTML = data.map((etf,i)=>{
     const spark = etf.sparkline||[];
     const isUp = spark.length>=2 && spark[spark.length-1]>=spark[spark.length-2];
-    const priceColor = isUp?'text-red-400':'text-green-400';
+    const priceColor = etf.chgPct>=0?'text-red-400':'text-green-400';
+    const chgColor = etf.chgPct>=0?'text-red-400':'text-green-400';
+    const chgSign = etf.chgPct>=0?'+':'';
     return `<tr class="animate-slide-in" style="animation-delay:${Math.min(i*20,400)}ms" data-code="${etf.code}">
       <td class="text-white font-body font-medium text-sm">${etf.name}</td>
       <td class="text-gray-500">${etf.code}</td>
       <td>${Number(etf.scale||0).toLocaleString()}</td>
       <td class="${priceColor} font-bold">${Number(etf.currentPrice).toFixed(3)}</td>
-      <td class="text-gray-400">${Number(etf.fee||0).toFixed(2)}</td>
+      <td class="${chgColor} font-bold">${chgSign}${Number(etf.chgPct||0).toFixed(2)}</td>
+      <td class="text-gray-400">${etf.fee!=null?Number(etf.fee).toFixed(2):'—'}</td>
+      <td class="text-gray-500 text-[11px] whitespace-normal" style="max-width:180px">${etf.feeDetail||'—'}</td>
       <td><div class="sparkline-container" id="spark-${etf.code}"></div></td>
       <td class="text-green-400">${etf.dropFromHigh!=null?Number(etf.dropFromHigh).toFixed(2):'—'}</td>
       <td class="text-red-400">${etf.riseFromLow!=null?'+'+Number(etf.riseFromLow).toFixed(2):'—'}</td>
@@ -322,6 +340,38 @@ function renderTable() {
           ])}
         }],animation:false
       });
+    });
+  });
+  // Pagination controls
+  renderPagination(allData.length, totalPages);
+}
+
+function renderPagination(totalItems, totalPages) {
+  document.getElementById('pageInfo').textContent = `第 ${state.page}/${totalPages} 页，共 ${totalItems} 条`;
+  const container = document.getElementById('pageButtons');
+  if (totalPages <= 1) { container.innerHTML = ''; return; }
+  let btns = [];
+  btns.push(`<button class="time-btn ${state.page===1?'opacity-30 cursor-default':''}" data-page="prev">‹</button>`);
+  const pages = new Set();
+  pages.add(1); pages.add(totalPages);
+  for (let p = Math.max(1, state.page-2); p <= Math.min(totalPages, state.page+2); p++) pages.add(p);
+  const sorted = [...pages].sort((a,b)=>a-b);
+  let prev = 0;
+  for (const p of sorted) {
+    if (p - prev > 1) btns.push(`<span class="text-gray-600 text-xs px-1">…</span>`);
+    btns.push(`<button class="time-btn ${state.page===p?'active':''}" data-page="${p}">${p}</button>`);
+    prev = p;
+  }
+  btns.push(`<button class="time-btn ${state.page===totalPages?'opacity-30 cursor-default':''}" data-page="next">›</button>`);
+  container.innerHTML = btns.join('');
+  container.querySelectorAll('button[data-page]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = btn.dataset.page;
+      if (v === 'prev' && state.page > 1) state.page--;
+      else if (v === 'next' && state.page < totalPages) state.page++;
+      else if (v !== 'prev' && v !== 'next') state.page = parseInt(v);
+      renderTable();
+      document.querySelector('.etf-table')?.closest('.overflow-auto')?.scrollTo(0, 0);
     });
   });
 }
@@ -397,12 +447,12 @@ async function renderKlineChart(){
 // ============================================================
 // EVENT BINDINGS & INIT
 // ============================================================
-document.getElementById('searchInput').addEventListener('input',e=>{state.search=e.target.value.trim();renderTable();});
+document.getElementById('searchInput').addEventListener('input',e=>{state.search=e.target.value.trim();state.page=1;renderTable();});
 document.getElementById('toggleFilters').addEventListener('click',()=>{
   const p=document.getElementById('filterPanel');p.style.display=p.style.display==='none'?'flex':'none';
 });
 document.getElementById('resetFilters').addEventListener('click',()=>{
-  state.search='';state.filters={};document.getElementById('searchInput').value='';
+  state.search='';state.filters={};state.page=1;document.getElementById('searchInput').value='';
   document.querySelectorAll('#filterPanel .filter-input').forEach(i=>i.value='');renderTable();
 });
 document.getElementById('closeModal').addEventListener('click',closeModalFn);
