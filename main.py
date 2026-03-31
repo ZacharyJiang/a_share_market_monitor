@@ -38,7 +38,7 @@ else:
 # CONFIG
 # ============================================================
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", "1"))
-KLINE_BATCH_SIZE = int(os.environ.get("KLINE_BATCH_SIZE", "10"))
+KLINE_BATCH_SIZE = int(os.environ.get("KLINE_BATCH_SIZE", "2"))
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 SPOT_CACHE = DATA_DIR / "spot_cache.json"
@@ -170,7 +170,20 @@ def fetch_spot_akshare():
     """Fetch ALL ETF spot data via AKShare. Returns dict {code: row_dict}."""
     import akshare as ak
     logger.info("AKShare: fetching spot data for all ETFs...")
-    df = ak.fund_etf_spot_em()
+    # 增加重试机制，最多重试3次
+    for retry in range(3):
+        try:
+            df = ak.fund_etf_spot_em()
+            if df is not None and not df.empty:
+                break
+            logger.warning(f"AKShare spot fetch returned empty, retry {retry+1}/3...")
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"AKShare spot fetch failed (retry {retry+1}/3): {e}")
+            time.sleep(2)
+    else:
+        logger.error("AKShare spot fetch failed after 3 retries")
+        return {}
     cols = list(df.columns)
     logger.info(f"AKShare spot columns: {cols}")
     df["代码"] = df["代码"].astype(str).str.zfill(6)
@@ -317,10 +330,23 @@ def fetch_kline_akshare(code: str, days: int = 1200) -> list:
     import akshare as ak
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    hist = ak.fund_etf_hist_em(
-        symbol=code, period="daily",
-        start_date=start_date, end_date=end_date, adjust="qfq"
-    )
+    # 增加重试机制，最多重试2次
+    for retry in range(2):
+        try:
+            hist = ak.fund_etf_hist_em(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq"
+            )
+            if hist is not None and not hist.empty:
+                break
+            logger.warning(f"Kline {code} fetch returned empty, retry {retry+1}/2...")
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Kline {code} fetch failed (retry {retry+1}/2): {e}")
+            time.sleep(0.5)
+    else:
+        logger.error(f"Kline {code} fetch failed after 2 retries")
+        return []
     if hist is None or hist.empty:
         return []
     cols = list(hist.columns)
@@ -507,11 +533,67 @@ def generate_mock():
 
 
 # ============================================================
+# 交易日历缓存
+# ============================================================
+_trading_dates = set()
+_last_trading_date_update = None
+
+def update_trading_calendar():
+    """更新A股交易日历，每年更新一次即可"""
+    global _trading_dates, _last_trading_date_update
+    now = datetime.now(BEIJING_TZ)
+    # 每年只更新一次，或者超过30天没更新就更新
+    if _last_trading_date_update and (now - _last_trading_date_update).days < 30:
+        return
+    try:
+        import akshare as ak
+        # 获取今年的交易日历
+        year = now.year
+        df = ak.tool_trade_date_hist_sina()
+        df["trade_date"] = df["trade_date"].astype(str)
+        # 缓存今年和去年的交易日
+        _trading_dates = set(df[df["trade_date"].str.startswith(str(year)) | df["trade_date"].str.startswith(str(year-1))]["trade_date"].tolist())
+        _last_trading_date_update = now
+        logger.info(f"交易日历更新完成，共缓存 {len(_trading_dates)} 个交易日")
+    except Exception as e:
+        logger.warning(f"交易日历更新失败: {e}")
+        # 失败时降级为只判断周末
+        pass
+
+def is_trading_day() -> bool:
+    """判断今天是否为A股交易日"""
+    now = datetime.now(BEIJING_TZ)
+    today_str = now.strftime("%Y%m%d")
+    # 先判断周末
+    if now.weekday() >= 5:
+        return False
+    # 如果有交易日历数据，用交易日历判断
+    if _trading_dates:
+        return today_str in _trading_dates
+    # 没有数据时降级为默认交易日（周一到周五）
+    return True
+
+def is_trading_time() -> bool:
+    """判断当前是否为A股交易时间：交易日 9:30-11:30, 13:00-15:00"""
+    if not is_trading_day():
+        return False
+    now = datetime.now(BEIJING_TZ)
+    hour = now.hour
+    minute = now.minute
+    current = hour * 100 + minute
+    # 9:30-11:30 或 13:00-15:00
+    return (930 <= current <= 1130) or (1300 <= current <= 1500)
+
+# ============================================================
 # REFRESH JOBS
 # ============================================================
 def refresh_spot():
-    """Fast refresh: spot data + indices for ALL ETFs. Runs every 1 min."""
+    """Fast refresh: spot data + indices for ALL ETFs. Runs every 1 min (only in trading time)."""
     global etf_spot, market_indices, last_updated, data_source
+    # 非交易时间跳过拉取
+    if not is_trading_time():
+        logger.debug("非交易时间，跳过行情更新")
+        return
     try:
         new_spot = fetch_spot_akshare()
         if not new_spot:
@@ -543,8 +625,12 @@ def refresh_spot():
 
 
 def refresh_kline_batch():
-    """Slow background: fetch kline + compute stats in batches."""
+    """Slow background: fetch kline + compute stats in batches. Only runs on trading days."""
     global etf_stats
+    # 非交易日跳过K线更新（收盘后K线不会变化）
+    if not is_trading_day():
+        logger.debug("非交易日，跳过K线更新")
+        return
     codes = list(etf_spot.keys())
     random.shuffle(codes)  # Randomize to spread load
     total = len(codes)
@@ -563,7 +649,7 @@ def refresh_kline_batch():
             except Exception as e:
                 logger.error(f"Kline {code}: {e}")
         logger.info(f"Kline batch progress: {min(i + KLINE_BATCH_SIZE, total)}/{total}")
-        time.sleep(0.5)  # Rate limit
+        time.sleep(3)  # 增加间隔，避免被封
     save_spot_cache()
     logger.info(f"Kline refresh complete: {done}/{total} updated")
 
