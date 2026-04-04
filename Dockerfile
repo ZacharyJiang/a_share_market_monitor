@@ -7,6 +7,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV REFRESH_MINUTES=1
+ENV KLINE_REFRESH_MINUTES=60
+ENV KLINE_BATCH_SIZE=1
+ENV BASE_REQUEST_INTERVAL=2.0
+ENV MAX_REQUEST_INTERVAL=10.0
+ENV CIRCUIT_BREAKER_THRESHOLD=5
+ENV CIRCUIT_BREAKER_COOLDOWN=300
+ENV USE_MOCK=true
+
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main_optimized:app", "--host", "0.0.0.0", "--port", "8080"]
