@@ -33,13 +33,28 @@ logger = logging.getLogger("etf-nexus")
 # ============================================================
 # PROXY CONFIG — route AKShare (requests/urllib) through a China proxy
 # ============================================================
-_PROXY = os.environ.get("AKSHARE_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-if _PROXY:
-    os.environ.setdefault("HTTP_PROXY", _PROXY)
-    os.environ.setdefault("HTTPS_PROXY", _PROXY)
-    logger.info(f"Proxy configured: {_PROXY}")
+from proxy_pool import get_proxy_pool, configure_proxy_pool
+
+# 初始化代理池
+proxy_pool = configure_proxy_pool(DATA_DIR if 'DATA_DIR' in locals() else None)
+
+# 检查是否启用代理池
+USE_PROXY_POOL = os.environ.get("USE_PROXY_POOL", "false").lower() == "true"
+
+if USE_PROXY_POOL:
+    logger.info("Proxy pool enabled")
+    # 尝试添加免费代理（可选）
+    if os.environ.get("USE_FREE_PROXIES", "false").lower() == "true":
+        proxy_pool.add_free_proxies()
 else:
-    logger.info("No proxy configured — AKShare will connect directly")
+    # 传统单一代理配置
+    _PROXY = os.environ.get("AKSHARE_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if _PROXY:
+        os.environ.setdefault("HTTP_PROXY", _PROXY)
+        os.environ.setdefault("HTTPS_PROXY", _PROXY)
+        logger.info(f"Single proxy configured: {_PROXY}")
+    else:
+        logger.info("No proxy configured — AKShare will connect directly")
 
 # ============================================================
 # CONFIG - 优化后的配置参数
@@ -291,6 +306,28 @@ def _safe_float(val, default=0):
         return default
 
 
+def _get_proxy_for_request():
+    """获取用于请求的代理"""
+    if USE_PROXY_POOL and proxy_pool:
+        return proxy_pool.get_proxy()
+    return None
+
+
+def _apply_proxy(proxy: dict):
+    """应用代理到环境变量"""
+    if proxy:
+        os.environ["HTTP_PROXY"] = proxy.get("http", "")
+        os.environ["HTTPS_PROXY"] = proxy.get("https", "")
+
+
+def _clear_proxy():
+    """清除代理环境变量"""
+    if "HTTP_PROXY" in os.environ:
+        del os.environ["HTTP_PROXY"]
+    if "HTTPS_PROXY" in os.environ:
+        del os.environ["HTTPS_PROXY"]
+
+
 def fetch_spot_akshare():
     """Fetch ALL ETF spot data via AKShare. Returns dict {code: row_dict}."""
     import akshare as ak
@@ -302,19 +339,43 @@ def fetch_spot_akshare():
     
     logger.info("AKShare: fetching spot data for all ETFs...")
     
+    # 获取代理
+    current_proxy = _get_proxy_for_request()
+    if current_proxy:
+        _apply_proxy(current_proxy)
+        logger.info(f"Using proxy: {current_proxy.get('http', '')[:30]}...")
+    
+    start_time = time.time()
+    
     for retry in range(3):
         try:
             _rate_limit_wait()
             df = ak.fund_etf_spot_em()
             if df is not None and not df.empty:
                 _record_success()
+                if current_proxy and USE_PROXY_POOL:
+                    proxy_pool.report_success(current_proxy, time.time() - start_time)
                 break
             logger.warning(f"AKShare spot fetch returned empty, retry {retry+1}/3...")
             _record_failure()
+            # 切换代理重试
+            if USE_PROXY_POOL and retry < 2:
+                current_proxy = _get_proxy_for_request()
+                if current_proxy:
+                    _apply_proxy(current_proxy)
+                    logger.info(f"Switching to proxy: {current_proxy.get('http', '')[:30]}...")
             time.sleep(_current_interval * 2)
         except Exception as e:
             logger.warning(f"AKShare spot fetch failed (retry {retry+1}/3): {e}")
             _record_failure()
+            if current_proxy and USE_PROXY_POOL:
+                proxy_pool.report_failure(current_proxy, str(e))
+            # 切换代理重试
+            if USE_PROXY_POOL and retry < 2:
+                current_proxy = _get_proxy_for_request()
+                if current_proxy:
+                    _apply_proxy(current_proxy)
+                    logger.info(f"Switching to proxy: {current_proxy.get('http', '')[:30]}...")
             time.sleep(_current_interval * 2)
     else:
         logger.error("AKShare spot fetch failed after 3 retries")
@@ -1022,6 +1083,12 @@ async def diag():
             if i >= 3:
                 break
             sample.append({**spot, "stats": etf_stats.get(code, {})})
+    
+    # 代理池状态
+    proxy_stats = {}
+    if USE_PROXY_POOL and proxy_pool:
+        proxy_stats = proxy_pool.get_stats()
+    
     return {
         "current_source": data_source,
         "current_etf_count": len(etf_spot),
@@ -1032,7 +1099,24 @@ async def diag():
         "current_interval": round(_current_interval, 2),
         "consecutive_failures": _consecutive_failures,
         "proxy": _PROXY or "none",
+        "use_proxy_pool": USE_PROXY_POOL,
+        "proxy_pool_stats": proxy_stats,
         "sample_etfs": sample,
+    }
+
+
+@app.get("/api/proxy-stats")
+async def proxy_stats():
+    """获取代理池统计信息"""
+    if not USE_PROXY_POOL or not proxy_pool:
+        return JSONResponse({
+            "enabled": False,
+            "message": "Proxy pool is not enabled. Set USE_PROXY_POOL=true to enable."
+        })
+    
+    return {
+        "enabled": True,
+        **proxy_pool.get_stats()
     }
 
 
