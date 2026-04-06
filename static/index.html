@@ -154,11 +154,15 @@ const COLUMNS = [
   {key:'scale',label:'规模(亿)',sortable:true,filterable:true},
   {key:'currentPrice',label:'现价',sortable:true,filterable:true},
   {key:'chgPct',label:'涨跌幅%',sortable:true,filterable:true},
-  {key:'fee',label:'总费率%',sortable:true,filterable:true},
+  {key:'fee',label:'总费率(%)',sortable:true,filterable:true},
   {key:'feeDetail',label:'费用明细',sortable:false,filterable:false},
   {key:'sparkline',label:'K线',sortable:false,filterable:false},
-  {key:'dropFromHigh',label:'离最高跌幅%',sortable:true,filterable:true},
-  {key:'riseFromLow',label:'离最低涨幅%',sortable:true,filterable:true},
+  {key:'allTimeHigh',label:'历史最高价',sortable:true,filterable:true},
+  {key:'allTimeHighDate',label:'历史最高价日期',sortable:true,filterable:false},
+  {key:'dropFromHigh',label:'距历史最高点跌幅(%)',sortable:true,filterable:true},
+  {key:'allTimeLow',label:'历史最低价',sortable:true,filterable:true},
+  {key:'allTimeLowDate',label:'历史最低价日期',sortable:true,filterable:false},
+  {key:'riseFromLow',label:'距历史最低点涨幅(%)',sortable:true,filterable:true},
   {key:'maxDD1Y',label:'1年最大回撤%',sortable:true,filterable:true},
   {key:'maxDD3Y',label:'3年最大回撤%',sortable:true,filterable:true},
 ];
@@ -314,7 +318,11 @@ function renderTable() {
       <td class="text-gray-400">${etf.fee!=null?Number(etf.fee).toFixed(2):'—'}</td>
       <td class="text-gray-500 text-[11px] whitespace-normal" style="max-width:180px">${etf.feeDetail||'—'}</td>
       <td><div class="sparkline-container" id="spark-${etf.code}"></div></td>
+      <td class="text-gray-300 font-bold">${etf.allTimeHigh!=null?Number(etf.allTimeHigh).toFixed(3):'—'}</td>
+      <td class="text-gray-400 text-xs">${etf.allTimeHighDate||'—'}</td>
       <td class="text-green-400">${etf.dropFromHigh!=null?Number(etf.dropFromHigh).toFixed(2):'—'}</td>
+      <td class="text-gray-300 font-bold">${etf.allTimeLow!=null?Number(etf.allTimeLow).toFixed(3):'—'}</td>
+      <td class="text-gray-400 text-xs">${etf.allTimeLowDate||'—'}</td>
       <td class="text-red-400">${etf.riseFromLow!=null?'+'+Number(etf.riseFromLow).toFixed(2):'—'}</td>
       <td class="text-yellow-400">${etf.maxDD1Y!=null?Number(etf.maxDD1Y).toFixed(2):'—'}</td>
       <td class="text-orange-400">${etf.maxDD3Y!=null?Number(etf.maxDD3Y).toFixed(2):'—'}</td>

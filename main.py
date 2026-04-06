@@ -62,10 +62,10 @@ KLINE_TOP_N = max(1, _env_int("KLINE_TOP_N", 80))
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
-API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 1.2)
-API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 8.0)
-SECONDARY_API_INTERVAL = _env_float("SECONDARY_API_INTERVAL", 0.45)
-CIRCUIT_BREAKER_THRESHOLD = _env_int("CIRCUIT_BREAKER_THRESHOLD", 4)
+API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 1.8)
+API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 12.0)
+SECONDARY_API_INTERVAL = _env_float("SECONDARY_API_INTERVAL", 0.8)
+CIRCUIT_BREAKER_THRESHOLD = _env_int("CIRCUIT_BREAKER_THRESHOLD", 3)
 CIRCUIT_BREAKER_COOLDOWN = _env_int("CIRCUIT_BREAKER_COOLDOWN", 180)
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -481,6 +481,49 @@ SINA_ETF_LIST_URL = (
 )
 SINA_INDEX_URL = "https://hq.sinajs.cn/list=s_sh000001,s_sz399001,s_sh000300"
 TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+EASTMONEY_FEE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+
+
+def fetch_fee_detail(code: str) -> Dict[str, float]:
+    """Fetch ETF fee details from Eastmoney."""
+    if code in _fee_cache:
+        return _fee_cache[code]
+    
+    for secid in _secid_candidates(code):
+        try:
+            request_controller.wait_for_slot()
+            payload = _request_json(
+                EASTMONEY_FEE_URL,
+                {
+                    "secid": secid,
+                    "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                    "fltt": "2",
+                    "invt": "2",
+                    "fields": "f443,f444",
+                },
+                retries=1,
+            )
+            data = payload.get("data") or {}
+            management_fee = _safe_float(data.get("f443"), default=-1)
+            custody_fee = _safe_float(data.get("f444"), default=-1)
+            
+            result = {}
+            if management_fee >= 0:
+                result["管理费"] = round(management_fee, 2)
+            if custody_fee >= 0:
+                result["托管费"] = round(custody_fee, 2)
+            
+            if result:
+                _fee_cache[code] = result
+                try:
+                    FEE_CACHE_FILE.write_text(json.dumps(_fee_cache, ensure_ascii=False), encoding="utf-8")
+                except Exception as e:
+                    logger.debug("Save fee cache failed: %s", e)
+                return result
+        except Exception as exc:
+            logger.debug("Fee fetch failed for %s: %s", code, exc)
+    
+    return {}
 
 
 def _calc_scale(row: Dict) -> float:
@@ -517,6 +560,8 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         return None
 
     fee_detail = _get_fee_detail(code)
+    if not fee_detail:
+        fee_detail = fetch_fee_detail(code)
     fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
     return {
@@ -551,6 +596,8 @@ def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[D
     scale = round(scale_hint, 2) if scale_hint > 0 else turnover
 
     fee_detail = _get_fee_detail(code)
+    if not fee_detail:
+        fee_detail = fetch_fee_detail(code)
     fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
     return {
@@ -776,7 +823,7 @@ def _tencent_symbol(code: str) -> str:
     return f"sz{code}"
 
 
-def _fetch_kline_from_eastmoney(code: str, days: int = 1200) -> List[Dict]:
+def _fetch_kline_from_eastmoney(code: str, days: int = 5000) -> List[Dict]:
     start_date = (datetime.now(BEIJING_TZ) - timedelta(days=days)).strftime("%Y%m%d")
     end_date = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
 
@@ -824,7 +871,7 @@ def _fetch_kline_from_eastmoney(code: str, days: int = 1200) -> List[Dict]:
     return []
 
 
-def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
+def _fetch_kline_from_tencent(code: str, days: int = 5000) -> List[Dict]:
     symbol = _tencent_symbol(code)
     start_cutoff = (datetime.now(BEIJING_TZ) - timedelta(days=days)).date()
 
@@ -881,7 +928,7 @@ def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
     return result
 
 
-def fetch_kline_live(code: str, days: int = 1200) -> List[Dict]:
+def fetch_kline_live(code: str, days: int = 5000) -> List[Dict]:
     eastmoney_kline = _fetch_kline_from_eastmoney(code, days)
     if eastmoney_kline:
         return eastmoney_kline
@@ -917,18 +964,40 @@ def compute_stats(kline: List[Dict]) -> Dict:
     if not kline or len(kline) < 10:
         return {}
 
-    closes = [k.get("close", 0) for k in kline if _safe_float(k.get("close")) > 0]
-    if len(closes) < 10:
+    valid_kline = [k for k in kline if _safe_float(k.get("high")) > 0 and _safe_float(k.get("low")) > 0]
+    if len(valid_kline) < 10:
         return {}
 
+    closes = [k.get("close", 0) for k in valid_kline]
     current = closes[-1]
-    all_high = max(closes)
-    all_low = min(closes)
+    
+    # Find all time high and corresponding date
+    all_high = -1
+    all_high_date = ""
+    for k in valid_kline:
+        high = _safe_float(k.get("high"))
+        if high > all_high:
+            all_high = high
+            all_high_date = k.get("date", "")
+    
+    # Find all time low and corresponding date
+    all_low = float("inf")
+    all_low_date = ""
+    for k in valid_kline:
+        low = _safe_float(k.get("low"))
+        if low < all_low:
+            all_low = low
+            all_low_date = k.get("date", "")
+
     one_year = closes[-250:] if len(closes) > 250 else closes
     three_year = closes[-750:] if len(closes) > 750 else closes
 
     return {
+        "allTimeHigh": round(all_high, 4),
+        "allTimeHighDate": all_high_date,
         "dropFromHigh": round((current - all_high) / all_high * 100, 2),
+        "allTimeLow": round(all_low, 4),
+        "allTimeLowDate": all_low_date,
         "riseFromLow": round((current - all_low) / all_low * 100, 2),
         "maxDD1Y": _max_drawdown(one_year),
         "maxDD3Y": _max_drawdown(three_year),
@@ -1151,7 +1220,11 @@ async def get_etf_data():
             stats = etf_stats.get(code, {})
             row = {
                 **spot,
+                "allTimeHigh": stats.get("allTimeHigh"),
+                "allTimeHighDate": stats.get("allTimeHighDate"),
                 "dropFromHigh": stats.get("dropFromHigh"),
+                "allTimeLow": stats.get("allTimeLow"),
+                "allTimeLowDate": stats.get("allTimeLowDate"),
                 "riseFromLow": stats.get("riseFromLow"),
                 "maxDD1Y": stats.get("maxDD1Y"),
                 "maxDD3Y": stats.get("maxDD3Y"),
