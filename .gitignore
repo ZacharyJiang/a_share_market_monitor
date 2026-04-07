@@ -4,3 +4,9 @@ etf_cache.json
 .env
 
 .venv/
+# Data files (collected locally)
+data/kline/*.json
+app.log
+app.run.log
+*.log
+*.bak

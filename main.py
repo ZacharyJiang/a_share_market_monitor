@@ -1105,9 +1105,10 @@ def refresh_kline_batch() -> None:
     if not etf_spot:
         return
 
-    if not is_trading_day() and not FORCE_REFRESH:
-        logger.debug("Skip kline refresh (non-trading day)")
-        return
+    # K线历史数据采集：允许非交易日采集，不需要限制交易日
+    # 只有限流就够了，实时行情才需要限制交易时间
+    if FORCE_REFRESH:
+        logger.debug("Kline refresh: force refresh enabled")
 
     codes = _prioritized_codes(KLINE_TOP_N)
     if not codes:
