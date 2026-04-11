@@ -58,7 +58,7 @@ def _env_float(name: str, default: float) -> float:
 REFRESH_MINUTES = _env_int("REFRESH_MINUTES", 2)
 KLINE_REFRESH_MINUTES = _env_int("KLINE_REFRESH_MINUTES", 180)
 KLINE_BATCH_SIZE = max(1, _env_int("KLINE_BATCH_SIZE", 2))
-KLINE_TOP_N = max(1, _env_int("KLINE_TOP_N", 80))
+KLINE_TOP_N = max(1, _env_int("KLINE_TOP_N", 200))
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
@@ -945,6 +945,20 @@ def fetch_kline_live(code: str, days: int = 5000) -> List[Dict]:
 # METRICS / TRADING TIME
 # ============================================================
 
+# Required fields in a valid stats entry (added over time; used for migration check)
+_REQUIRED_STATS_FIELDS = {
+    "allTimeHigh", "allTimeHighDate", "dropFromHigh",
+    "allTimeLow", "allTimeLowDate", "riseFromLow",
+    "sparkline",
+}
+
+
+def _stats_is_complete(stats: Dict) -> bool:
+    """Return True only if stats contains all required fields with non-None values."""
+    if not stats:
+        return False
+    return all(stats.get(f) is not None for f in _REQUIRED_STATS_FIELDS)
+
 
 def _max_drawdown(values: List[float]) -> float:
     if not values or len(values) < 2:
@@ -1023,7 +1037,58 @@ def _should_refresh_spot(force: bool = False) -> bool:
 
 def _should_update_kline(code: str) -> bool:
     today = _today_bj_str()
-    return _last_kline_update.get(code) != today
+    if _last_kline_update.get(code) != today:
+        return True
+    # Even if fetched today, re-fetch if stats are incomplete (e.g. after upgrade)
+    with _lock:
+        stats = etf_stats.get(code, {})
+    return not _stats_is_complete(stats)
+
+
+def backfill_stats_from_kline_files() -> None:
+    """
+    Startup-time job: scan all local kline JSON files and (re)compute stats for
+    any ETF whose stats are missing or lack the required fields introduced in
+    newer versions of compute_stats().  This ensures backward-compatibility when
+    the server is upgraded without wiping the cache.
+    """
+    if not KLINE_DIR.exists():
+        return
+
+    files = list(KLINE_DIR.glob("*.json"))
+    if not files:
+        return
+
+    updated = 0
+    today = _today_bj_str()
+    for path in files:
+        code = path.stem
+        with _lock:
+            existing = etf_stats.get(code, {})
+        if _stats_is_complete(existing):
+            continue
+        try:
+            kline = load_kline(code)
+            if len(kline) < 10:
+                continue
+            stats = compute_stats(kline)
+            if not stats:
+                continue
+            with _lock:
+                etf_stats[code] = stats
+                # Mark as updated today so the regular kline refresh won't
+                # re-fetch unnecessarily (it will still refresh after today)
+                if _last_kline_update.get(code) != today:
+                    _last_kline_update[code] = today
+            updated += 1
+        except Exception as exc:
+            logger.debug("Backfill stats failed (%s): %s", code, exc)
+
+    if updated > 0:
+        save_spot_cache()
+        logger.info("Stats backfill complete: updated=%s / scanned=%s", updated, len(files))
+    else:
+        logger.info("Stats backfill: all %s kline files already have complete stats", len(files))
 
 
 def _prioritized_codes(limit: int) -> List[str]:
@@ -1205,6 +1270,10 @@ async def lifespan(app: FastAPI):
 
     # Warm up kline for top ETFs in background once.
     threading.Thread(target=refresh_kline_batch, daemon=True).start()
+
+    # Back-fill stats from any existing kline files that lack the new fields
+    # (e.g. after a server upgrade where compute_stats gained new columns).
+    threading.Thread(target=backfill_stats_from_kline_files, daemon=True).start()
 
     yield
     scheduler.shutdown(wait=False)
