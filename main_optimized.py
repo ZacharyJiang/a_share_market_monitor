@@ -62,7 +62,10 @@ def _env_float(name: str, default: float) -> float:
 REFRESH_MINUTES = _env_int("REFRESH_MINUTES", 2)
 KLINE_REFRESH_MINUTES = _env_int("KLINE_REFRESH_MINUTES", 180)
 KLINE_BATCH_SIZE = max(1, _env_int("KLINE_BATCH_SIZE", 2))
-KLINE_TOP_N = max(1, _env_int("KLINE_TOP_N", 200))
+# KLINE_TOP_N: 控制每批 K 线刷新处理的 ETF 数量
+# 0 或负数表示处理全部 ETF（按规模降序）
+# 正数表示只处理前 N 只规模较大的 ETF
+KLINE_TOP_N = _env_int("KLINE_TOP_N", 0)
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
@@ -1141,40 +1144,37 @@ def backfill_stats_from_kline_files() -> None:
         logger.info("Stats backfill: all %s kline files already have complete stats", len(files))
 
 
-def _prioritized_codes(limit: int) -> List[str]:
-    MIN_SCALE_BILLION = 10.0
+def _prioritized_codes(limit: int = 0) -> List[str]:
+    """
+    返回按规模排序的 ETF 代码列表。
+    
+    Args:
+        limit: 限制返回数量，0 表示返回全部
+    
+    排序规则：
+    1. 按规模（scale）降序排列
+    2. 规模相同的按成交量（turnover）降序排列
+    """
     with _lock:
-        # 分成两组：规模 > 10亿 和 规模 <= 10亿
-        large = []
-        small = []
+        # 获取所有 ETF 并按规模降序排序
+        all_etfs = []
         for code, info in etf_spot.items():
             scale = _safe_float(info.get("scale"))
-            if scale > MIN_SCALE_BILLION:
-                large.append((code, info))
-            else:
-                small.append((code, info))
-        # 两组都按成交量 -> 规模降序排序
-        large_sorted = sorted(
-            large,
-            key=lambda item: (
-                _safe_float(item[1].get("turnover")),
-                _safe_float(item[1].get("scale")),
-            ),
+            turnover = _safe_float(info.get("turnover"))
+            all_etfs.append((code, scale, turnover))
+        
+        # 按规模降序，规模相同按成交量降序
+        sorted_etfs = sorted(
+            all_etfs,
+            key=lambda x: (x[1], x[2]),  # (scale, turnover)
             reverse=True,
         )
-        small_sorted = sorted(
-            small,
-            key=lambda item: (
-                _safe_float(item[1].get("turnover")),
-                _safe_float(item[1].get("scale")),
-            ),
-            reverse=True,
-        )
-        # 先大后小，合并结果，确保大的先更新，小的最后更新
-        all_codes = [code for code, _ in large_sorted] + [code for code, _ in small_sorted]
-        # 仍然限制最大返回数量，避免一次性处理太多
-        if limit > 0 and len(all_codes) > limit * 10:
-            return all_codes[:limit * 10]
+        
+        all_codes = [code for code, _, _ in sorted_etfs]
+        
+        # 如果指定了 limit 且大于 0，则限制返回数量
+        if limit > 0 and len(all_codes) > limit:
+            return all_codes[:limit]
         return all_codes
 
 
@@ -1241,6 +1241,10 @@ def refresh_spot(force: bool = False) -> None:
 
 
 def refresh_kline_batch() -> None:
+    """
+    批量刷新 K 线数据。
+    采集全部 ETF（按规模降序），KLINE_TOP_N 控制每批处理数量。
+    """
     if not etf_spot:
         return
 
@@ -1248,16 +1252,26 @@ def refresh_kline_batch() -> None:
         logger.debug("Skip kline refresh (non-trading day)")
         return
 
-    codes = _prioritized_codes(KLINE_TOP_N)
-    if not codes:
+    # 获取全部 ETF，按规模降序排列
+    all_codes = _prioritized_codes(limit=0)
+    if not all_codes:
         return
 
     today = _today_bj_str()
     done = 0
     skipped = 0
+    failed = 0
+    
+    # 计算实际需要处理的 ETF 数量
+    # KLINE_TOP_N = 0 表示处理全部，否则只处理前 KLINE_TOP_N 只
+    target_count = len(all_codes) if KLINE_TOP_N <= 0 else min(KLINE_TOP_N, len(all_codes))
+    codes_to_process = all_codes[:target_count]
 
-    for start in range(0, len(codes), KLINE_BATCH_SIZE):
-        batch = codes[start : start + KLINE_BATCH_SIZE]
+    logger.info("Starting kline refresh: total=%s, target=%s, batch_size=%s", 
+                len(all_codes), target_count, KLINE_BATCH_SIZE)
+
+    for start in range(0, len(codes_to_process), KLINE_BATCH_SIZE):
+        batch = codes_to_process[start : start + KLINE_BATCH_SIZE]
 
         for code in batch:
             if not _should_update_kline(code):
@@ -1267,6 +1281,7 @@ def refresh_kline_batch() -> None:
             try:
                 kline = fetch_kline_live(code)
                 if len(kline) < 10:
+                    failed += 1
                     continue
 
                 save_kline(code, kline)
@@ -1276,16 +1291,19 @@ def refresh_kline_batch() -> None:
                     _last_kline_update[code] = today
                 done += 1
             except Exception as exc:
+                failed += 1
                 logger.debug("Kline refresh failed (%s): %s", code, exc)
 
     if done > 0:
         save_spot_cache()
 
     logger.info(
-        "Kline refresh done: updated=%s skipped=%s target=%s",
+        "Kline refresh done: updated=%s skipped=%s failed=%s target=%s total_etfs=%s",
         done,
         skipped,
-        len(codes),
+        failed,
+        target_count,
+        len(all_codes),
     )
 
 
