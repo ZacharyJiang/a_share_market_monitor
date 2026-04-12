@@ -1206,52 +1206,6 @@ def _should_refresh_spot(force: bool = False) -> bool:
     return force or FORCE_REFRESH or is_trading_time()
 
 
-def _ensure_all_etfs_in_spot():
-    """
-    确保所有 ETF（包括从 kline 文件和 fee 缓存中发现的）都在 spot 中。
-    这可以修复某些 ETF 在前端不显示的问题。
-    """
-    global etf_spot
-    
-    with _lock:
-        added_count = 0
-        
-        # 从 K 线文件中发现 ETF
-        if KLINE_DIR.exists():
-            for kline_file in KLINE_DIR.glob("*.json"):
-                code = kline_file.stem
-                if code not in etf_spot and len(code) == 6:
-                    # 尝试从 K 线文件读取基本信息
-                    try:
-                        kline_data = json.load(open(kline_file, encoding="utf-8"))
-                        if kline_data:
-                            etf_spot[code] = {
-                                "code": code,
-                                "name": f"ETF-{code}",  # 临时名称
-                                "currentPrice": kline_data[-1].get("close") if kline_data else None,
-                                "chgPct": None,
-                                "scale": None,
-                            }
-                            added_count += 1
-                    except Exception:
-                        pass
-        
-        # 从费率缓存中发现 ETF
-        for code in _fee_cache:
-            if code not in etf_spot and len(code) == 6:
-                etf_spot[code] = {
-                    "code": code,
-                    "name": f"ETF-{code}",  # 临时名称
-                    "currentPrice": None,
-                    "chgPct": None,
-                    "scale": None,
-                }
-                added_count += 1
-        
-        if added_count > 0:
-            logger.info(f"Added {added_count} ETFs from kline/fee files to spot cache")
-
-
 def _should_update_kline(code: str, force: bool = False) -> bool:
     """
     判断是否需要更新 K 线数据。
@@ -1316,52 +1270,119 @@ def backfill_stats_from_kline_files() -> None:
         logger.info("Stats backfill: all %s kline files already have complete stats", len(files))
 
 
+def _fetch_etf_name_from_eastmoney(code: str) -> Optional[str]:
+    """从东方财富搜索 API 获取 ETF 真实名称"""
+    try:
+        # 使用东方财富搜索接口
+        url = "https://searchapi.eastmoney.com/api/suggest/get"
+        params = {
+            "input": code,
+            "type": 14,  # 14 表示 ETF/LOF
+            "count": 5,
+            "market": "",
+            "source": "WEB"
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/"
+        }
+        
+        resp = SESSION.get(url, params=params, headers=headers, timeout=5)
+        data = resp.json()
+        
+        if data and data.get("QuotationCodeTable"):
+            items = data["QuotationCodeTable"].get("Data", [])
+            for item in items:
+                # 匹配代码
+                if item.get("Code") == code or item.get("SecurityCode") == code:
+                    name = item.get("Name", "").strip()
+                    if name and name != f"ETF {code}" and name != f"ETF-{code}":
+                        return name
+                        
+        # 备用：尝试从基金详情页获取
+        try:
+            fund_url = f"http://fund.eastmoney.com/pingzhongdata/{code}.js"
+            resp = SESSION.get(fund_url, timeout=5)
+            text = resp.text
+            # 解析基金名称
+            import re
+            name_match = re.search(r'var\s+fS_name\s*=\s*"([^"]+)"', text)
+            if name_match:
+                return name_match.group(1).strip()
+        except Exception:
+            pass
+            
+    except Exception as e:
+        logger.debug(f"Failed to fetch name for {code}: {e}")
+    
+    return None
+
+
 def _ensure_all_etfs_in_spot() -> None:
     """
     确保所有已知的 ETF 都在 etf_spot 中。
     从 K 线目录和费率缓存中发现的 ETF 如果不在 spot 中，会添加占位条目。
+    同时尝试从东方财富获取真实名称。
     """
     global etf_spot
     
     with _lock:
+        added_count = 0
+        
         # 从 K 线文件中发现的 ETF
         if KLINE_DIR.exists():
             for kline_file in KLINE_DIR.glob("*.json"):
                 code = kline_file.stem
-                if code not in etf_spot:
+                if code not in etf_spot and len(code) == 6:
                     try:
-                        kline_data = json.loads(kline_file.read_text(encoding="utf-8"))
-                        if kline_data:
-                            first_item = kline_data[0] if isinstance(kline_data, list) else kline_data
-                            etf_spot[code] = {
-                                "code": code,
-                                "name": first_item.get("name", f"ETF {code}"),
-                                "currentPrice": 0.0,
-                                "chgPct": 0.0,
-                                "scale": 0.0,
-                                "source": "kline_discovery"
-                            }
-                            logger.info(f"Added ETF {code} from kline file to spot cache")
+                        # 尝试从东方财富获取真实名称
+                        name = _fetch_etf_name_from_eastmoney(code)
+                        if not name:
+                            # 尝试从 K 线文件读取名称
+                            kline_data = json.loads(kline_file.read_text(encoding="utf-8"))
+                            if kline_data and isinstance(kline_data, list):
+                                name = kline_data[0].get("name", "")
+                        
+                        if not name:
+                            name = f"ETF {code}"
+                            
+                        etf_spot[code] = {
+                            "code": code,
+                            "name": name,
+                            "currentPrice": 0.0,
+                            "chgPct": 0.0,
+                            "scale": 0.0,
+                            "source": "kline_discovery"
+                        }
+                        added_count += 1
+                        logger.info(f"Added ETF {code} ({name}) from kline file")
                     except Exception as e:
-                        logger.debug(f"Failed to read kline for {code}: {e}")
+                        logger.debug(f"Failed to process kline for {code}: {e}")
         
         # 从费率缓存中发现的 ETF
         if FEE_CACHE_FILE.exists():
             try:
                 fee_data = json.loads(FEE_CACHE_FILE.read_text(encoding="utf-8"))
                 for code in fee_data.keys():
-                    if code not in etf_spot:
+                    if code not in etf_spot and len(code) == 6:
+                        # 尝试从东方财富获取真实名称
+                        name = _fetch_etf_name_from_eastmoney(code) or f"ETF {code}"
+                        
                         etf_spot[code] = {
                             "code": code,
-                            "name": f"ETF {code}",
+                            "name": name,
                             "currentPrice": 0.0,
                             "chgPct": 0.0,
                             "scale": 0.0,
                             "source": "fee_discovery"
                         }
-                        logger.info(f"Added ETF {code} from fee cache to spot cache")
+                        added_count += 1
+                        logger.info(f"Added ETF {code} ({name}) from fee cache")
             except Exception as e:
                 logger.debug(f"Failed to read fee cache: {e}")
+        
+        if added_count > 0:
+            logger.info(f"Total added {added_count} ETFs from kline/fee files")
 
 
 def _prioritized_codes(limit: int = 0) -> List[str]:
