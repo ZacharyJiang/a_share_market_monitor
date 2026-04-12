@@ -199,9 +199,15 @@ def _discover_funds_async():
         time.sleep(5)  # 等待启动完成
         _ensure_all_etfs_in_spot()
     except Exception as e:
-        logger.error(f"Fund discovery failed: {e}")
+        logger.error(f"Fund discovery failed: {e}", exc_info=True)
 
 threading.Thread(target=_discover_funds_async, daemon=True).start()
+
+# 主程序启动入口
+if __name__ == "__main__":
+    import uvicorn
+    # 必须绑定0.0.0.0，容器外部才能访问
+    uvicorn.run(app, host="0.0.0.0", port=8080, workers=1)
 
 
 # ============================================================
