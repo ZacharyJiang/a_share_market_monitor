@@ -82,6 +82,33 @@ FEE_CACHE_FILE = DATA_DIR / "fee_cache.json"
 KLINE_DIR = DATA_DIR / "kline"
 KLINE_DIR.mkdir(exist_ok=True)
 
+# 溢价数据缓存
+_premium_cache: Dict[str, float] = {}
+_premium_cache_file = DATA_DIR / "premium_cache.json"
+
+
+def _load_premium_cache():
+    """加载溢价缓存"""
+    global _premium_cache
+    if _premium_cache_file.exists():
+        try:
+            _premium_cache = json.load(open(_premium_cache_file, encoding="utf-8"))
+        except Exception:
+            _premium_cache = {}
+    return _premium_cache
+
+
+def _save_premium_cache():
+    """保存溢价缓存"""
+    try:
+        _premium_cache_file.write_text(json.dumps(_premium_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# 初始化加载
+_load_premium_cache()
+
 
 # ============================================================
 # HTTP SESSION
@@ -978,6 +1005,38 @@ def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
     return result
 
 
+def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
+    """Fetch ETF premium/discount rate from Eastmoney"""
+    for secid in _secid_candidates(code):
+        try:
+            # 使用分时数据接口获取溢价率
+            url = f"https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                "secid": secid,
+                "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f170,f171,f172,f173,f174,f175,f176,f177,f178,f179,f180,f181,f182,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192,f193,f194,f195,f196,f197,f198,f199,f200,f201,f202,f203,f204,f205,f206,f207,f208,f209,f210,f211,f212,f213,f214,f215,f216,f217,f218,f219,f220,f221,f222,f223,f224,f225,f226,f227,f228,f229,f230,f231,f232,f233,f234,f235,f236,f237,f238,f239,f240,f241,f242,f243,f244,f245,f246,f247,f248,f249,f250,f251,f252,f253,f254,f255,f256,f257,f258,f259,f260,f261,f262,f263,f264,f265,f266,f267,f268,f269,f270,f271,f272,f273,f274,f275,f276,f277,f278,f279,f280,f281,f282,f283,f284,f285,f286,f287,f288,f289,f290,f291,f292,f293,f294,f295,f296,f297,f298,f299,f300",
+            }
+            payload = _request_json(url, params, retries=1)
+            if not payload or not payload.get("data"):
+                continue
+            
+            data = payload.get("data", {})
+            # f184 是溢价率字段
+            premium = data.get("f184")
+            if premium is not None:
+                premium_val = _safe_float(premium)
+                if premium_val != 0 or data.get("f43"):  # 确保有数据
+                    with _lock:
+                        _premium_cache[code] = premium_val
+                        _save_premium_cache()
+                    logger.debug("Updated premium for %s: %.2f%%", code, premium_val)
+                    return premium_val
+            
+        except Exception as exc:
+            logger.debug("Fetch premium failed for %s: %s", code, exc)
+    
+    return None
+
+
 def _fetch_fee_from_eastmoney(code: str) -> bool:
     """Fetch management fee and other fees from Eastmoney fund page"""
     for secid in _secid_candidates(code):
@@ -1145,6 +1204,52 @@ def is_trading_time() -> bool:
 
 def _should_refresh_spot(force: bool = False) -> bool:
     return force or FORCE_REFRESH or is_trading_time()
+
+
+def _ensure_all_etfs_in_spot():
+    """
+    确保所有 ETF（包括从 kline 文件和 fee 缓存中发现的）都在 spot 中。
+    这可以修复某些 ETF 在前端不显示的问题。
+    """
+    global etf_spot
+    
+    with _lock:
+        added_count = 0
+        
+        # 从 K 线文件中发现 ETF
+        if KLINE_DIR.exists():
+            for kline_file in KLINE_DIR.glob("*.json"):
+                code = kline_file.stem
+                if code not in etf_spot and len(code) == 6:
+                    # 尝试从 K 线文件读取基本信息
+                    try:
+                        kline_data = json.load(open(kline_file, encoding="utf-8"))
+                        if kline_data:
+                            etf_spot[code] = {
+                                "code": code,
+                                "name": f"ETF-{code}",  # 临时名称
+                                "currentPrice": kline_data[-1].get("close") if kline_data else None,
+                                "chgPct": None,
+                                "scale": None,
+                            }
+                            added_count += 1
+                    except Exception:
+                        pass
+        
+        # 从费率缓存中发现 ETF
+        for code in _fee_cache:
+            if code not in etf_spot and len(code) == 6:
+                etf_spot[code] = {
+                    "code": code,
+                    "name": f"ETF-{code}",  # 临时名称
+                    "currentPrice": None,
+                    "chgPct": None,
+                    "scale": None,
+                }
+                added_count += 1
+        
+        if added_count > 0:
+            logger.info(f"Added {added_count} ETFs from kline/fee files to spot cache")
 
 
 def _should_update_kline(code: str, force: bool = False) -> bool:
@@ -1590,6 +1695,10 @@ async def get_etf_data():
                     row["fee"] = round(sum(fee_detail.values()), 2)
                     row["feeDetail"] = _format_fee_detail(fee_detail)
             row.setdefault("feeDetail", "")
+            # 添加溢价数据（如果存在）
+            if "premium" not in row and code in _premium_cache:
+                row["premium"] = _premium_cache[code]
+            row.setdefault("premium", None)
             etfs.append(row)
 
         return JSONResponse(
