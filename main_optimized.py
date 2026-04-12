@@ -761,6 +761,43 @@ def _fetch_indices_from_sina() -> List[Dict]:
     return result
 
 
+def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
+    """
+    从东方财富获取 ETF 溢价率数据。
+    返回溢价率百分比（如 0.5 表示溢价 0.5%），None 表示获取失败。
+    """
+    for secid in _secid_candidates(code):
+        try:
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                "secid": secid,
+                "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f169,f170,f171,f172,f173,f177,f183,f184,f185,f186,f187,f188,f189,f190",
+                "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            }
+            payload = _request_json(url, params, retries=1)
+            data = payload.get("data")
+            if not data:
+                continue
+            
+            # f184 是溢价率字段（百分比）
+            premium = data.get("f184")
+            if premium is not None:
+                return round(_safe_float(premium), 2)
+            
+            # 如果 f184 没有，尝试计算：溢价率 = (市价 - 净值) / 净值 * 100
+            price = _safe_float(data.get("f43"))  # 当前价
+            nav = _safe_float(data.get("f183"))   # 单位净值
+            if price > 0 and nav > 0:
+                premium = ((price - nav) / nav) * 100
+                return round(premium, 2)
+                
+        except Exception as exc:
+            logger.debug(f"Failed to fetch premium for {code} with secid {secid}: {exc}")
+            continue
+    
+    return None
+
+
 def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]]:
     last_err = None
 
@@ -770,6 +807,14 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
             spot = _fetch_spot_from_endpoint(endpoint)
             if spot:
                 logger.info("Spot fetched from %s, count=%s", endpoint, len(spot))
+                # 为每个 ETF 获取溢价数据
+                for code in spot:
+                    try:
+                        premium = _fetch_premium_from_eastmoney(code)
+                        if premium is not None:
+                            spot[code]["premium"] = premium
+                    except Exception as e:
+                        logger.debug(f"Failed to fetch premium for {code}: {e}")
                 return "eastmoney", spot
         except Exception as exc:
             last_err = exc
@@ -780,6 +825,14 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
         spot = _fetch_spot_from_sina(scale_hints)
         if spot:
             logger.info("Spot fetched from Sina, count=%s", len(spot))
+            # Sina 数据不包含溢价，尝试从 Eastmoney 获取
+            for code in spot:
+                try:
+                    premium = _fetch_premium_from_eastmoney(code)
+                    if premium is not None:
+                        spot[code]["premium"] = premium
+                except Exception as e:
+                    logger.debug(f"Failed to fetch premium for {code}: {e}")
             return "sina", spot
     except Exception as exc:
         last_err = exc
@@ -1158,9 +1211,58 @@ def backfill_stats_from_kline_files() -> None:
         logger.info("Stats backfill: all %s kline files already have complete stats", len(files))
 
 
+def _ensure_all_etfs_in_spot() -> None:
+    """
+    确保所有已知的 ETF 都在 etf_spot 中。
+    从 K 线目录和费率缓存中发现的 ETF 如果不在 spot 中，会添加占位条目。
+    """
+    global etf_spot
+    
+    with _lock:
+        # 从 K 线文件中发现的 ETF
+        if KLINE_DIR.exists():
+            for kline_file in KLINE_DIR.glob("*.json"):
+                code = kline_file.stem
+                if code not in etf_spot:
+                    try:
+                        kline_data = json.loads(kline_file.read_text(encoding="utf-8"))
+                        if kline_data:
+                            first_item = kline_data[0] if isinstance(kline_data, list) else kline_data
+                            etf_spot[code] = {
+                                "code": code,
+                                "name": first_item.get("name", f"ETF {code}"),
+                                "currentPrice": 0.0,
+                                "chgPct": 0.0,
+                                "scale": 0.0,
+                                "source": "kline_discovery"
+                            }
+                            logger.info(f"Added ETF {code} from kline file to spot cache")
+                    except Exception as e:
+                        logger.debug(f"Failed to read kline for {code}: {e}")
+        
+        # 从费率缓存中发现的 ETF
+        if FEE_CACHE_FILE.exists():
+            try:
+                fee_data = json.loads(FEE_CACHE_FILE.read_text(encoding="utf-8"))
+                for code in fee_data.keys():
+                    if code not in etf_spot:
+                        etf_spot[code] = {
+                            "code": code,
+                            "name": f"ETF {code}",
+                            "currentPrice": 0.0,
+                            "chgPct": 0.0,
+                            "scale": 0.0,
+                            "source": "fee_discovery"
+                        }
+                        logger.info(f"Added ETF {code} from fee cache to spot cache")
+            except Exception as e:
+                logger.debug(f"Failed to read fee cache: {e}")
+
+
 def _prioritized_codes(limit: int = 0) -> List[str]:
     """
     返回按规模排序的 ETF 代码列表。
+    包括所有在 etf_spot 中的 ETF，确保没有遗漏。
     
     Args:
         limit: 限制返回数量，0 表示返回全部
@@ -1169,6 +1271,9 @@ def _prioritized_codes(limit: int = 0) -> List[str]:
     1. 按规模（scale）降序排列
     2. 规模相同的按成交量（turnover）降序排列
     """
+    # 首先确保所有已知的 ETF 都在 spot 中
+    _ensure_all_etfs_in_spot()
+    
     with _lock:
         # 获取所有 ETF 并按规模降序排序
         all_etfs = []
