@@ -189,25 +189,32 @@ def get_premium_for_display(code: str) -> Optional[float]:
 
 
 # 初始化加载
-_load_premium_cache()
-_load_close_premium_cache()
+try:
+    _load_premium_cache()
+    _load_close_premium_cache()
+    logger.info("Cache loaded successfully")
+except Exception as e:
+    logger.error(f"Cache load failed: {e}", exc_info=True)
 
 # 确保所有场内基金都在spot列表中
 # 异步运行，避免阻塞启动
 def _discover_funds_async():
     try:
+        logger.info("Starting fund discovery in background")
         time.sleep(5)  # 等待启动完成
         _ensure_all_etfs_in_spot()
+        logger.info("Fund discovery completed")
     except Exception as e:
         logger.error(f"Fund discovery failed: {e}", exc_info=True)
 
-threading.Thread(target=_discover_funds_async, daemon=True).start()
+try:
+    threading.Thread(target=_discover_funds_async, daemon=True).start()
+    logger.info("Fund discovery thread started")
+except Exception as e:
+    logger.error(f"Failed to start fund discovery thread: {e}", exc_info=True)
 
-# 主程序启动入口
-if __name__ == "__main__":
-    import uvicorn
-    # 必须绑定0.0.0.0，容器外部才能访问
-    uvicorn.run(app, host="0.0.0.0", port=8080, workers=1)
+# 服务启动完成日志
+logger.info("✅ ETF monitor service started successfully, listening on port 8080")
 
 
 # ============================================================
@@ -1425,6 +1432,7 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
     """
     funds = {}
     try:
+        logger.info("📥 Fetching all exchange funds from Eastmoney...")
         # 获取所有场内基金列表（包括ETF、LOF等）
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         params = {
@@ -1442,16 +1450,31 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
         }
         
         payload = _request_json(url, params, retries=2)
-        if payload and payload.get("data") and payload["data"].get("diff"):
-            for item in payload["data"]["diff"]:
-                code = item.get("f12", "").strip()
-                name = item.get("f14", "").strip()
-                if code and name and len(code) == 6:
-                    funds[code] = name
+        if not payload:
+            logger.warning("⚠️ Empty response from fund list API")
+            return funds
+        
+        data = payload.get("data")
+        if not data:
+            logger.warning("⚠️ No data field in fund list response")
+            return funds
+        
+        diff = data.get("diff")
+        if not diff or not isinstance(diff, list):
+            logger.warning("⚠️ No diff list in fund list response")
+            return funds
+        
+        for item in diff:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("f12", "").strip()
+            name = item.get("f14", "").strip()
+            if code and name and len(code) == 6:
+                funds[code] = name
                     
-        logger.info(f"Fetched {len(funds)} exchange funds from Eastmoney")
+        logger.info(f"✅ Successfully fetched {len(funds)} exchange funds from Eastmoney")
     except Exception as e:
-        logger.error(f"Failed to fetch exchange funds: {e}")
+        logger.error(f"❌ Failed to fetch exchange funds: {e}", exc_info=True)
     
     return funds
 
