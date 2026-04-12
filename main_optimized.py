@@ -192,6 +192,17 @@ def get_premium_for_display(code: str) -> Optional[float]:
 _load_premium_cache()
 _load_close_premium_cache()
 
+# 确保所有场内基金都在spot列表中
+# 异步运行，避免阻塞启动
+def _discover_funds_async():
+    try:
+        time.sleep(5)  # 等待启动完成
+        _ensure_all_etfs_in_spot()
+    except Exception as e:
+        logger.error(f"Fund discovery failed: {e}")
+
+threading.Thread(target=_discover_funds_async, daemon=True).start()
+
 
 # ============================================================
 # HTTP SESSION
@@ -1409,12 +1420,13 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
     funds = {}
     try:
         # 获取所有场内基金列表（包括ETF、LOF等）
-        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
         params = {
             "pn": 1,
             "pz": 5000,  # 获取5000只，应该覆盖所有
             "po": 1,
             "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 必须和spot接口用同一个ut参数
             "fltt": 2,
             "invt": 2,
             "fid": "f12",  # 按代码排序
@@ -1767,6 +1779,10 @@ async def lifespan(app: FastAPI):
         len(etf_spot),
         cache_loaded,
     )
+
+    # 确保所有场内基金都在列表中（包括ETF、LOF、QDII等）
+    _ensure_all_etfs_in_spot()
+    logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
 
     scheduler.add_job(
         refresh_spot,
