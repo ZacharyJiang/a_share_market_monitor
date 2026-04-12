@@ -997,7 +997,7 @@ async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]
     batch_size = 100
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
-        premiums = await _fetch_premium_batch_async(batch)
+        premiums = _fetch_premium_batch_sync_async(batch)
         
         # 更新spot数据
         for code, premium in premiums.items():
@@ -1182,7 +1182,7 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
     return None
 
 
-async def _fetch_premium_batch_async(codes: List[str]) -> Dict[str, float]:
+def _fetch_premium_batch_sync_async(codes: List[str]) -> Dict[str, float]:
     """
     异步批量获取ETF溢价率数据。
     使用多并发请求，不阻塞主线程。
