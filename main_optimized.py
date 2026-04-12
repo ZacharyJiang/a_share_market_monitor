@@ -86,6 +86,10 @@ KLINE_DIR.mkdir(exist_ok=True)
 _premium_cache: Dict[str, float] = {}
 _premium_cache_file = DATA_DIR / "premium_cache.json"
 
+# 收盘溢价数据缓存
+_close_premium_cache: Dict[str, Dict] = {}
+_close_premium_cache_file = DATA_DIR / "close_premium_cache.json"
+
 
 def _load_premium_cache():
     """加载溢价缓存"""
@@ -106,8 +110,87 @@ def _save_premium_cache():
         pass
 
 
+def _load_close_premium_cache():
+    """加载收盘溢价缓存"""
+    global _close_premium_cache
+    if _close_premium_cache_file.exists():
+        try:
+            _close_premium_cache = json.load(open(_close_premium_cache_file, encoding="utf-8"))
+        except Exception:
+            _close_premium_cache = {}
+    return _close_premium_cache
+
+
+def _save_close_premium_cache():
+    """保存收盘溢价缓存"""
+    try:
+        _close_premium_cache_file.write_text(json.dumps(_close_premium_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def save_close_premium_at_market_close(session: str = "afternoon"):
+    """
+    收盘时保存当前溢价为收盘溢价。
+    
+    Args:
+        session: "morning" 表示上午收盘(11:30)，"afternoon" 表示下午收盘(15:00)
+    """
+    global _close_premium_cache
+    now = datetime.now(BEIJING_TZ)
+    today = now.strftime("%Y-%m-%d")
+    
+    for code, premium in _premium_cache.items():
+        _close_premium_cache[code] = {
+            "premium": premium,
+            "date": today,
+            "session": session  # 标记是上午还是下午收盘
+        }
+    
+    _save_close_premium_cache()
+    logger.info(f"Saved {session} close premium for {len(_premium_cache)} ETFs on {today}")
+
+
+def get_premium_for_display(code: str) -> Optional[float]:
+    """
+    获取用于展示的溢价数据。
+    
+    逻辑：
+    - 交易时间（9:30-11:30, 13:00-15:00）：返回实时溢价
+    - 午间休市（11:30-13:00）：返回上午收盘溢价
+    - 收盘后（15:00-次日9:30）：返回下午收盘溢价
+    - 非交易日：返回最近一个交易日的收盘溢价
+    """
+    now = datetime.now(BEIJING_TZ)
+    hhmm = now.hour * 100 + now.minute
+    is_trading_day_flag = is_trading_day()
+    
+    # 交易时间内：返回实时溢价
+    if is_trading_day_flag and ((930 <= hhmm <= 1130) or (1300 <= hhmm <= 1500)):
+        return _premium_cache.get(code)
+    
+    # 午间休市（11:30-13:00）：尝试返回上午收盘溢价
+    if is_trading_day_flag and 1130 < hhmm < 1300:
+        # 查找今天保存的收盘溢价（上午收盘时保存的）
+        today = now.strftime("%Y-%m-%d")
+        close_data = _close_premium_cache.get(code)
+        if close_data and close_data.get("date") == today:
+            return close_data.get("premium")
+        # 如果没有今天的记录，返回实时溢价（可能是11:30前的最后数据）
+        return _premium_cache.get(code)
+    
+    # 收盘后或周末：返回最近一个交易日的收盘溢价
+    close_data = _close_premium_cache.get(code)
+    if close_data:
+        return close_data.get("premium")
+    
+    # 如果没有收盘溢价记录，返回实时溢价
+    return _premium_cache.get(code)
+
+
 # 初始化加载
 _load_premium_cache()
+_load_close_premium_cache()
 
 
 # ============================================================
@@ -1669,6 +1752,26 @@ async def lifespan(app: FastAPI):
         hour=3,  # 每天凌晨3点执行
         minute=0,
         id="fee_refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加收盘溢价保存任务 - 上午收盘 11:30
+    scheduler.add_job(
+        lambda: save_close_premium_at_market_close("morning"),
+        "cron",
+        hour=11,
+        minute=30,
+        id="save_morning_close_premium",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加收盘溢价保存任务 - 下午收盘 15:00
+    scheduler.add_job(
+        lambda: save_close_premium_at_market_close("afternoon"),
+        "cron",
+        hour=15,
+        minute=0,
+        id="save_afternoon_close_premium",
         max_instances=1,
         coalesce=True,
     )
