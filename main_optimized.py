@@ -711,7 +711,8 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
     name = str(row.get("f14", "")).strip()
     price = _safe_float(row.get("f2"))
 
-    if len(code) != 6 or not name or price <= 0:
+    # 不过滤价格为0的基金，即使非交易时间没有报价也要显示所有基金
+    if len(code) != 6 or not name:
         return None
 
     fee_detail = _get_fee_detail(code)
@@ -739,7 +740,8 @@ def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[D
     name = str(row.get("name", "")).strip()
     price = _safe_float(row.get("trade"))
 
-    if len(code) != 6 or not name or price <= 0:
+    # 不过滤价格为0的基金，即使非交易时间没有报价也要显示所有基金
+    if len(code) != 6 or not name:
         return None
 
     turnover_yuan = _safe_float(row.get("amount"))
@@ -1814,8 +1816,22 @@ def refresh_spot(force: bool = False) -> None:
         index_provider, new_indices = fetch_indices_live()
 
         with _lock:
+            # 先保留原有所有基金的基本信息
+            all_funds = etf_spot.copy()
+            # 用新获取的行情数据更新已有基金
+            for code, data in new_spot.items():
+                all_funds[code] = data
+            # 确保所有已经发现的基金都在列表里，即使没有行情数据
+            for code, fund_info in all_funds.items():
+                # 没有行情数据的基金保留基本信息，其他字段设为默认值
+                if not fund_info.get("currentPrice"):
+                    fund_info["currentPrice"] = 0.0
+                    fund_info["chgPct"] = 0.0
+                    fund_info["volume"] = 0
+                    fund_info["turnover"] = 0.0
+            # 更新etf_spot
             etf_spot.clear()
-            etf_spot.update(new_spot)
+            etf_spot.update(all_funds)
 
             for code in list(etf_stats.keys()):
                 if code not in etf_spot:
