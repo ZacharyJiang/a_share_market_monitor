@@ -771,19 +771,19 @@ def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[D
 
 
 def _fetch_spot_from_endpoint(url: str) -> Dict[str, Dict]:
-    base_params = {
-        "pn": "1",
-        "pz": "200",
-        "po": "1",
-        "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": "2",
-        "invt": "2",
-        "wbp2u": "|0|0|0|web",
-        "fid": "f12",
-        "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
-        "fields": "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18,f20,f21,f38,f441",
-    }
+        base_params = {
+            "pn": "1",
+            "pz": "1000",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "wbp2u": "|0|0|0|web",
+            "fid": "f12",
+            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
+            "fields": "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18,f20,f21,f38,f441,f183,f184",
+        }
 
     first = _request_json(url, base_params, retries=2)
     data = first.get("data") or {}
@@ -1687,18 +1687,24 @@ def _ensure_all_etfs_in_spot() -> None:
         for code, data in existing_etf_data.items():
             etf_spot[code] = data
         # 再添加新发现的基金，只加原来没有的
-        for code, name in exchange_funds.items():
-            if code not in etf_spot and len(code) == 6:
-                etf_spot[code] = {
-                    "code": code,
-                    "name": name,
-                    "currentPrice": 0.0,
-                    "chgPct": 0.0,
-                    "scale": 0.0,
-                    "source": "exchange_list"
-                }
-                added_count += 1
-                logger.info(f"Added fund {code} ({name}) from exchange list")
+            for code, name in exchange_funds.items():
+                if code not in etf_spot and len(code) == 6:
+                    etf_spot[code] = {
+                        "code": code,
+                        "name": name,
+                        "currentPrice": 0.0,
+                        "chgPct": 0.0,
+                        "scale": 0.0,
+                        "source": "exchange_list"
+                    }
+                    added_count += 1
+                    logger.info(f"Added fund {code} ({name}) from exchange list")
+                    # 新基金自动触发费率和K线采集，不用等定时任务
+                    try:
+                        threading.Thread(target=_fetch_fee_from_eastmoney, args=(code,), daemon=True).start()
+                        threading.Thread(target=fetch_kline_live, args=(code,), daemon=True).start()
+                    except Exception as e:
+                        logger.debug(f"触发新基金{code}采集失败: {e}")
         
         # 2. 从 K 线文件中发现的 ETF（补充）
         if KLINE_DIR.exists():
@@ -1998,6 +2004,152 @@ def refresh_kline_batch(force: bool = False) -> None:
     )
 
 
+def check_and_fill_missing_data():
+    """
+    每小时检查缺失数据并补全：
+    1. 价格为0的基金：单独拉取行情
+    2. 溢价缺失的基金：触发溢价补采
+    3. 费率缺失的基金：触发费率采集
+    """
+    try:
+        global etf_spot
+        with _lock:
+            all_codes = list(etf_spot.keys())
+        
+        # 统计缺失数据
+        missing_price = []
+        missing_premium = []
+        missing_fee = []
+        for code in all_codes:
+            etf = etf_spot.get(code, {})
+            if etf.get("currentPrice", 0) == 0:
+                missing_price.append(code)
+            if etf.get("premium") is None and code not in _premium_cache:
+                missing_premium.append(code)
+            if code not in _fee_cache:
+                missing_fee.append(code)
+        
+        logger.info(f"📊 数据完整性统计：总基金{len(all_codes)}只，价格缺失{len(missing_price)}只，溢价缺失{len(missing_premium)}只，费率缺失{len(missing_fee)}只")
+        
+        # 补全缺失价格
+        if missing_price:
+            logger.info(f"🔄 开始补全{len(missing_price)}只价格缺失基金的行情")
+            success = 0
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Referer": "https://quote.eastmoney.com/"
+            })
+            for idx, code in enumerate(missing_price):
+                try:
+                    secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+                    url = "https://push2.eastmoney.com/api/qt/stock/get"
+                    params = {
+                        "secid": secid,
+                        "fields": "f43,f170",  # f43=最新价(放大1000倍), f170=涨跌幅
+                        "ut": "7eea3edcaed734bea9cbfc24409ed989"
+                    }
+                    resp = session.get(url, params=params, timeout=5)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json().get("data", {})
+                    price = _safe_float(data.get("f43")) / 1000
+                    chg = _safe_float(data.get("f170"))
+                    if price > 0:
+                        with _lock:
+                            if code in etf_spot:
+                                etf_spot[code]["currentPrice"] = round(price, 4)
+                                etf_spot[code]["chgPct"] = round(chg, 2)
+                        success += 1
+                except Exception as e:
+                    logger.debug(f"补全价格失败 {code}: {e}")
+                # 限流控制
+                if (idx + 1) % 20 == 0:
+                    time.sleep(1)
+            logger.info(f"✅ 价格补全完成：成功{success}/{len(missing_price)}只")
+        
+        # 补全缺失溢价
+        if missing_premium:
+            logger.info(f"🔄 开始补全{len(missing_premium)}只溢价缺失基金的溢价率")
+            _fetch_premium_batch_sync(missing_premium)
+        
+        # 补全缺失费率
+        if missing_fee:
+            logger.info(f"🔄 开始补全{len(missing_fee)}只费率缺失基金的费率")
+            done = 0
+            failed = 0
+            for idx, code in enumerate(missing_fee):
+                try:
+                    if _fetch_fee_from_eastmoney(code):
+                        done += 1
+                except Exception as e:
+                    failed += 1
+                    logger.debug(f"补全费率失败 {code}: {e}")
+                # 限流控制
+                if (idx + 1) % 20 == 0:
+                    time.sleep(1)
+            logger.info(f"✅ 费率补全完成：成功{done}/{len(missing_fee)}只")
+        
+        # 保存最新数据
+        save_spot_cache()
+        logger.info("✅ 数据补全任务完成")
+    except Exception as e:
+        logger.error(f"❌ 数据补全任务失败: {e}", exc_info=True)
+
+
+def refresh_all_fees() -> None:
+    """
+    批量采集所有 ETF 的费率数据。
+    独立于 K 线采集，确保费率数据完整。
+    """
+    if not etf_spot:
+        logger.warning("No ETF spot data available, skipping fee refresh")
+        return
+    
+    # 获取全部 ETF，按规模降序排列
+    all_codes = _prioritized_codes(limit=0)
+    if not all_codes:
+        return
+    
+    # 找出费率数据缺失的 ETF
+    missing_fee_codes = [code for code in all_codes if code not in _fee_cache]
+    
+    logger.info("Starting fee refresh: total_etfs=%s, missing_fees=%s", 
+                len(all_codes), len(missing_fee_codes))
+    
+    done = 0
+    failed = 0
+    
+    # 优先采集缺失费率的 ETF
+    for code in missing_fee_codes:
+        try:
+            if _fetch_fee_from_eastmoney(code):
+                done += 1
+        except Exception as exc:
+            failed += 1
+            logger.debug("Fee refresh failed for %s: %s", code, exc)
+    
+    # 再随机采集一部分已有费率的 ETF 进行更新（避免数据过期）
+    existing_fee_codes = [code for code in all_codes if code in _fee_cache]
+    import random
+    sample_size = min(50, len(existing_fee_codes))  # 每天更新50个已有费率的 ETF
+    sample_codes = random.sample(existing_fee_codes, sample_size) if existing_fee_codes else []
+    
+    for code in sample_codes:
+        try:
+            if _fetch_fee_from_eastmoney(code):
+                done += 1
+        except Exception as exc:
+            logger.debug("Fee refresh (update) failed for %s: %s", code, exc)
+    
+    logger.info(
+        "Fee refresh done: updated=%s failed=%s total missing=%s",
+        done,
+        failed,
+        len(missing_fee_codes),
+    )
+
+
 # ============================================================
 # FASTAPI APP
 # ============================================================
@@ -2093,25 +2245,34 @@ async def lifespan(app: FastAPI):
         coalesce=True,
     )
     # 添加独立溢价刷新任务，每5分钟运行一次
-    scheduler.add_job(
-        refresh_all_premium,
-        "interval",
-        minutes=5,
-        id="premium_refresh",
-        max_instances=1,
-        coalesce=True,
-    )
-    # 添加每日基金发现任务，每天凌晨2点执行，发现新增ETF/LOF
-    scheduler.add_job(
-        _ensure_all_etfs_in_spot,
-        "cron",
-        hour=2,
-        minute=0,
-        id="etf_discovery",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.start()
+        scheduler.add_job(
+            refresh_all_premium,
+            "interval",
+            minutes=5,
+            id="premium_refresh",
+            max_instances=1,
+            coalesce=True,
+        )
+        # 添加每日基金发现定时任务，每天凌晨2点执行，发现新增ETF/LOF，补全缺失基金
+        scheduler.add_job(
+            _ensure_all_etfs_in_spot,
+            "cron",
+            hour=2,
+            minute=0,
+            id="etf_discovery",
+            max_instances=1,
+            coalesce=True,
+        )
+        # 添加数据完整性校验定时任务，每小时运行一次，统计缺失数据并补全
+        scheduler.add_job(
+            check_and_fill_missing_data,
+            "interval",
+            minutes=60,
+            id="data_fill",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
 
     # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
     # Use a lambda to pass force=True parameter.
