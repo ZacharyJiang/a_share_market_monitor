@@ -71,9 +71,9 @@ KLINE_TOP_N = _env_int("KLINE_TOP_N", 0)
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
-API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 1.2)
-API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 8.0)
-SECONDARY_API_INTERVAL = _env_float("SECONDARY_API_INTERVAL", 0.45)
+API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 2.5)      # 基础间隔从1.2s提升到2.5s，避免触发东方财富限流
+API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 15.0)       # 最大退避间隔提升到15s
+SECONDARY_API_INTERVAL = _env_float("SECONDARY_API_INTERVAL", 1.0)  # 新浪接口间隔也提高
 CIRCUIT_BREAKER_THRESHOLD = _env_int("CIRCUIT_BREAKER_THRESHOLD", 4)
 CIRCUIT_BREAKER_COOLDOWN = _env_int("CIRCUIT_BREAKER_COOLDOWN", 180)
 
@@ -1295,8 +1295,9 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
         except Exception as e:
             logger.debug(f"溢价获取失败 {code}: {e}")
         
+        # 限流控制，每20条请求后暂停3秒（降低频率避免东方财富限流）
         if (idx + 1) % 20 == 0:
-            time.sleep(1)
+            time.sleep(3)
     
     if results:
         _save_premium_cache()
