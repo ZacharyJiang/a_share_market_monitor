@@ -920,7 +920,9 @@ def _fetch_indices_from_sina() -> List[Dict]:
 def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
     """
     从东方财富获取 ETF 溢价率数据。
-    返回溢价率百分比（如 0.5 表示溢价 0.5%），None 表示获取失败。
+    返回溢价率百分比（如 0.5 表示溢价 0.5%），None 表示获取失败或非交易时间无数据。
+    
+    修复：f184=0 或 f183=0 时返回 None（非交易时间），不返回 0！
     """
     for secid in _secid_candidates(code):
         try:
@@ -936,9 +938,10 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
                 continue
             
             # f184 是溢价率字段（百分比）
-            premium = data.get("f184")
-            if premium is not None:
-                return round(_safe_float(premium), 2)
+            # 关键修复：f184=0 说明非交易时间或API未更新，返回 None 而不是 0
+            f184_val = _safe_float(data.get("f184"))
+            if f184_val is not None and f184_val != 0 and abs(f184_val) < 30:
+                return round(f184_val, 2)
             
             # 如果 f184 没有，尝试计算：溢价率 = (市价 - 净值) / 净值 * 100
             price = _safe_float(data.get("f43"))  # 当前价
@@ -1223,6 +1226,8 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     """
     同步批量获取ETF溢价率数据。
     废弃不可靠的批量接口f184字段，改用单条股票接口获取准确溢价率，和东方财富APP完全对齐
+    
+    关键修复：非交易时间f184返回0时，保留历史有效值，不覆盖！
     """
     results = {}
     if not codes:
@@ -1235,14 +1240,14 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     })
     
     success = 0
+    skipped_zero = 0
     for idx, code in enumerate(codes):
         try:
-            # 构造secid: 5/6/9开头沪市为1.代码，其他为0.代码
             secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
             url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
                 "secid": secid,
-                "fields": "f43,f183,f184,f58",  # f43=最新价(放大1000倍), f183=单位净值, f184=官方溢价率
+                "fields": "f43,f183,f184,f58",
                 "ut": "7eea3edcaed734bea9cbfc24409ed989"
             }
             
@@ -1254,9 +1259,12 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
             if not data:
                 continue
             
-            # 获取官方溢价率，优先使用，100%和东方财富APP一致
+            # 获取官方溢价率
             f184 = _safe_float(data.get("f184"))
-            if f184 is not None and abs(f184) < 30:
+            
+            # 关键修复：f184=0 表示无数据（非交易时间或API未更新），不能覆盖历史值
+            # 只有当 f184 是有意义的非零值时才使用
+            if f184 is not None and f184 != 0 and abs(f184) < 30:
                 premium = round(f184, 2)
                 results[code] = premium
                 with _lock:
@@ -1264,9 +1272,10 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                 success += 1
                 continue
             
-            # 官方溢价率不存在时，自己计算
-            price = _safe_float(data.get("f43")) / 1000  # 价格放大1000倍，还原
+            # 尝试用价格和净值计算
+            price = _safe_float(data.get("f43")) / 1000
             nav = _safe_float(data.get("f183"))
+            # 只有当价格和净值都大于0时才计算（说明是有效的实时数据）
             if price > 0 and nav > 0:
                 premium = round(((price - nav) / nav) * 100, 2)
                 if abs(premium) < 30:
@@ -1274,18 +1283,25 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     with _lock:
                         _premium_cache[code] = premium
                     success += 1
+            else:
+                # 非交易时间：保留历史有效溢价，不从results中写入0
+                # 但如果缓存中已有有效值，将其带入结果
+                with _lock:
+                    cached_val = _premium_cache.get(code)
+                if cached_val is not None and cached_val != 0:
+                    results[code] = cached_val
+                skipped_zero += 1
         
         except Exception as e:
             logger.debug(f"溢价获取失败 {code}: {e}")
         
-        # 限流控制，每秒最多20次请求
         if (idx + 1) % 20 == 0:
             time.sleep(1)
     
     if results:
         _save_premium_cache()
     
-    logger.info(f"溢价采集完成: 成功 {success}/{len(codes)} 只，总缓存 {len(_premium_cache)} 只")
+    logger.info(f"溢价采集完成: 成功 {success}/{len(codes)} 只, 保留历史 {skipped_zero} 只, 总缓存 {len(_premium_cache)} 只")
     return results
 
 
@@ -2324,7 +2340,10 @@ async def get_etf_data():
             row.setdefault("feeDetail", "")
             # 添加溢价数据（如果存在）
             if "premium" not in row and code in _premium_cache:
-                row["premium"] = _premium_cache[code]
+                cached_premium = _premium_cache[code]
+                # 只使用非零的有效溢价值（0表示无数据，不应展示）
+                if cached_premium is not None and cached_premium != 0:
+                    row["premium"] = cached_premium
             row.setdefault("premium", None)
             etfs.append(row)
 
