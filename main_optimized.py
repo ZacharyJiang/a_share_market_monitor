@@ -943,6 +943,7 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
     返回溢价率百分比（如 0.5 表示溢价 0.5%），None 表示获取失败或非交易时间无数据。
     
     修复：f184=0 或 f183=0 时返回 None（非交易时间），不返回 0！
+    修复：添加 fltt=2 参数，并对 f43/f183 做放大1000倍的安全判断。
     """
     for secid in _secid_candidates(code):
         try:
@@ -951,6 +952,7 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
                 "secid": secid,
                 "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f169,f170,f171,f172,f173,f177,f183,f184,f185,f186,f187,f188,f189,f190",
                 "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                "fltt": "2",  # 关键修复：添加fltt=2让API返回实际值
             }
             payload = _request_json(url, params, retries=1)
             data = payload.get("data")
@@ -964,8 +966,13 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
                 return round(f184_val, 2)
             
             # 如果 f184 没有，尝试计算：溢价率 = (市价 - 净值) / 净值 * 100
-            price = _safe_float(data.get("f43"))  # 当前价
-            nav = _safe_float(data.get("f183"))   # 单位净值
+            # fltt=2 时通常返回实际值，但保险起见做放大1000倍的判断
+            price_raw = _safe_float(data.get("f43"))  # 当前价
+            nav_raw = _safe_float(data.get("f183"))   # 单位净值
+            
+            price = price_raw / 1000 if price_raw > 100 else price_raw
+            nav = nav_raw / 1000 if nav_raw > 100 else nav_raw
+            
             if price > 0 and nav > 0:
                 premium = ((price - nav) / nav) * 100
                 return round(premium, 2)
@@ -1252,7 +1259,8 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
             params = {
                 "secid": secid,
                 "fields": "f43,f44,f45,f46,f47,f57,f58,f170,f183,f184",
-                "ut": "7eea3edcaed734bea9cbfc24409ed989"
+                "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                "fltt": "2",  # 关键修复：添加fltt=2让API返回实际值（小数），而不是放大1000倍的整数
             }
             
             resp = session.get(url, params=params, timeout=5)
@@ -1272,20 +1280,21 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     _premium_cache[code] = premium
                 success += 1
                 # 同时更新spot中的nav
-                nav_raw = _safe_float(data.get("f183"))
-                if nav_raw > 0 and code in etf_spot:
+                nav_raw_1 = _safe_float(data.get("f183"))
+                nav_1 = nav_raw_1 / 1000 if nav_raw_1 > 100 else nav_raw_1
+                if nav_1 > 0 and code in etf_spot:
                     with _lock:
-                        etf_spot[code]["nav"] = round(nav_raw, 4)
+                        etf_spot[code]["nav"] = round(nav_1, 4)
                 continue
             
             # 方法2：用价格(f43)和净值(f183)手动计算溢价
-            # 注意：f43在非交易时间可能返回0或上一次收盘价（放大1000倍的整数）
-            # f183是净值，可能返回实际值（小数）
+            # fltt=2 时 f43 和 f183 返回实际值（小数）
+            # 但保险起见，仍然做放大1000倍的判断
             price_raw = _safe_float(data.get("f43"))
             nav_raw = _safe_float(data.get("f183"))
             
-            # f43 是放大1000倍的价格（东方财富API特性）
-            # 但需要注意：某些情况下 f43 可能已经是实际价格（小数）
+            # f43 可能是放大1000倍的价格（东方财富API特性）
+            # fltt=2 通常返回实际价格，但某些情况下可能仍是放大值
             price = 0.0
             if price_raw > 100:
                 # 大于100说明是放大了1000倍（如4739 -> 4.739）
@@ -1294,8 +1303,14 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                 # 可能已经是实际价格
                 price = price_raw
             
-            # f183 是净值，通常返回实际值
-            nav = nav_raw
+            # f183 净值同样可能被放大1000倍
+            # 修复：对净值也做放大1000倍的判断（之前遗漏了这个处理）
+            nav = 0.0
+            if nav_raw > 100:
+                # 大于100说明是放大了1000倍（如4750 -> 4.750）
+                nav = nav_raw / 1000
+            elif nav_raw > 0:
+                nav = nav_raw
             
             if price > 0 and nav > 0:
                 premium = round(((price - nav) / nav) * 100, 2)
@@ -1311,11 +1326,12 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     continue
             
             # 方法3：从spot中获取价格，结合API的净值计算
-            if nav_raw > 0:
+            # 使用已处理过的 nav（已除以1000如果需要），而不是原始的 nav_raw
+            if nav > 0:
                 with _lock:
                     spot_price = etf_spot.get(code, {}).get("currentPrice", 0)
-                if spot_price > 0 and nav_raw > 0:
-                    premium = round(((spot_price - nav_raw) / nav_raw) * 100, 2)
+                if spot_price > 0 and nav > 0:
+                    premium = round(((spot_price - nav) / nav) * 100, 2)
                     if abs(premium) < 30:
                         results[code] = premium
                         with _lock:
@@ -1323,7 +1339,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                         # 更新spot中的nav
                         if code in etf_spot:
                             with _lock:
-                                etf_spot[code]["nav"] = round(nav_raw, 4)
+                                etf_spot[code]["nav"] = round(nav, 4)
                         calc_success += 1
                         continue
             
@@ -2126,15 +2142,19 @@ def check_and_fill_missing_data():
                     url = "https://push2.eastmoney.com/api/qt/stock/get"
                     params = {
                         "secid": secid,
-                        "fields": "f43,f170",  # f43=最新价(放大1000倍), f170=涨跌幅
-                        "ut": "7eea3edcaed734bea9cbfc24409ed989"
+                        "fields": "f43,f170",  # f43=最新价, f170=涨跌幅
+                        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                        "fltt": "2",  # 返回实际值
                     }
                     resp = session.get(url, params=params, timeout=5)
                     if resp.status_code != 200:
                         continue
                     data = resp.json().get("data", {})
-                    price = _safe_float(data.get("f43")) / 1000
-                    chg = _safe_float(data.get("f170"))
+                    price_raw = _safe_float(data.get("f43"))
+                    # fltt=2 通常返回实际价格，但保险起见做判断
+                    price = price_raw / 1000 if price_raw > 100 else price_raw
+                    chg_raw = _safe_float(data.get("f170"))
+                    chg = chg_raw / 100 if abs(chg_raw) > 100 else chg_raw
                     if price > 0:
                         with _lock:
                             if code in etf_spot:
