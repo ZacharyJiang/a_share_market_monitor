@@ -718,7 +718,17 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
     fee_detail = _get_fee_detail(code)
     fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
-    return {
+    # 从列表API中提取净值(f183)和溢价率(f184)
+    # fltt=2 时，f183返回实际净值（如4.75），f184返回溢价率百分比（如0.52）
+    nav = _safe_float(row.get("f183"))
+    premium = _safe_float(row.get("f184"))
+    # f184=0可能表示无数据（非交易时间），需要区分
+    # 只有当f184有意义的非零值时才使用，或者价格和净值都有效时手动计算
+    if premium == 0 and price > 0 and nav > 0 and abs(price - nav) > 0.0001:
+        # 列表API的溢价率为0但价格和净值不同，手动计算
+        premium = round(((price - nav) / nav) * 100, 2)
+
+    result = {
         "code": code,
         "name": name,
         "currentPrice": round(price, 4),
@@ -733,6 +743,16 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         "low": round(_safe_float(row.get("f16")), 4),
         "prevClose": round(_safe_float(row.get("f18")), 4),
     }
+    # 添加净值和溢价数据（仅当有效时）
+    if nav > 0:
+        result["nav"] = round(nav, 4)
+    if premium != 0 and abs(premium) < 30:
+        result["premium"] = round(premium, 2)
+        # 同步更新溢价缓存
+        with _lock:
+            _premium_cache[code] = round(premium, 2)
+
+    return result
 
 
 def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[Dict]:
@@ -781,7 +801,7 @@ def _fetch_spot_from_endpoint(url: str) -> Dict[str, Dict]:
         "invt": "2",
         "wbp2u": "|0|0|0|web",
         "fid": "f12",
-        "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
+        "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17,m:0+t:18,m:1+t:18,m:0+t:20,m:1+t:20",
         "fields": "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18,f20,f21,f38,f441,f183,f184",
     }
 
@@ -1027,7 +1047,7 @@ async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]
     # 更新全局etf_spot中的溢价数据，确保异步更新生效
     with _lock:
         for code, premium in _premium_cache.items():
-            if code in etf_spot and premium != 0:
+            if code in etf_spot and abs(premium) < 30:
                 etf_spot[code]["premium"] = round(premium, 2)
     save_spot_cache()
     
@@ -1057,7 +1077,7 @@ def refresh_all_premium() -> None:
     # 更新全局etf_spot中的溢价数据
     with _lock:
         for code, premium in _premium_cache.items():
-            if code in etf_spot and premium != 0:
+            if code in etf_spot and abs(premium) < 30:
                 etf_spot[code]["premium"] = round(premium, 2)
         # 更新last_updated时间戳
         last_updated = _now_bj_str()
@@ -1209,7 +1229,8 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     同步批量获取ETF溢价率数据。
     废弃不可靠的批量接口f184字段，改用单条股票接口获取准确溢价率，和东方财富APP完全对齐
     
-    关键修复：非交易时间f184返回0时，保留历史有效值，不覆盖！
+    关键修复：非交易时间f184返回0时，尝试用f43(价格)和f183(净值)手动计算溢价。
+    如果价格和净值也无法获取，保留历史有效值，不覆盖为0！
     """
     results = {}
     if not codes:
@@ -1222,6 +1243,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     })
     
     success = 0
+    calc_success = 0
     skipped_zero = 0
     for idx, code in enumerate(codes):
         try:
@@ -1229,7 +1251,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
             url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
                 "secid": secid,
-                "fields": "f43,f183,f184,f58",
+                "fields": "f43,f44,f45,f46,f47,f57,f58,f170,f183,f184",
                 "ut": "7eea3edcaed734bea9cbfc24409ed989"
             }
             
@@ -1241,38 +1263,77 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
             if not data:
                 continue
             
-            # 获取官方溢价率
+            # 方法1：获取官方溢价率 f184
             f184 = _safe_float(data.get("f184"))
-            
-            # 关键修复：f184=0 表示无数据（非交易时间或API未更新），不能覆盖历史值
-            # 只有当 f184 是有意义的非零值时才使用
             if f184 is not None and f184 != 0 and abs(f184) < 30:
                 premium = round(f184, 2)
                 results[code] = premium
                 with _lock:
                     _premium_cache[code] = premium
                 success += 1
+                # 同时更新spot中的nav
+                nav_raw = _safe_float(data.get("f183"))
+                if nav_raw > 0 and code in etf_spot:
+                    with _lock:
+                        etf_spot[code]["nav"] = round(nav_raw, 4)
                 continue
             
-            # 尝试用价格和净值计算
-            price = _safe_float(data.get("f43")) / 1000
-            nav = _safe_float(data.get("f183"))
-            # 只有当价格和净值都大于0时才计算（说明是有效的实时数据）
+            # 方法2：用价格(f43)和净值(f183)手动计算溢价
+            # 注意：f43在非交易时间可能返回0或上一次收盘价（放大1000倍的整数）
+            # f183是净值，可能返回实际值（小数）
+            price_raw = _safe_float(data.get("f43"))
+            nav_raw = _safe_float(data.get("f183"))
+            
+            # f43 是放大1000倍的价格（东方财富API特性）
+            # 但需要注意：某些情况下 f43 可能已经是实际价格（小数）
+            price = 0.0
+            if price_raw > 100:
+                # 大于100说明是放大了1000倍（如4739 -> 4.739）
+                price = price_raw / 1000
+            elif price_raw > 0:
+                # 可能已经是实际价格
+                price = price_raw
+            
+            # f183 是净值，通常返回实际值
+            nav = nav_raw
+            
             if price > 0 and nav > 0:
                 premium = round(((price - nav) / nav) * 100, 2)
                 if abs(premium) < 30:
                     results[code] = premium
                     with _lock:
                         _premium_cache[code] = premium
-                    success += 1
-            else:
-                # 非交易时间：保留历史有效溢价，不从results中写入0
-                # 但如果缓存中已有有效值，将其带入结果
+                    # 更新spot中的nav
+                    if code in etf_spot:
+                        with _lock:
+                            etf_spot[code]["nav"] = round(nav, 4)
+                    calc_success += 1
+                    continue
+            
+            # 方法3：从spot中获取价格，结合API的净值计算
+            if nav_raw > 0:
                 with _lock:
-                    cached_val = _premium_cache.get(code)
-                if cached_val is not None and cached_val != 0:
-                    results[code] = cached_val
-                skipped_zero += 1
+                    spot_price = etf_spot.get(code, {}).get("currentPrice", 0)
+                if spot_price > 0 and nav_raw > 0:
+                    premium = round(((spot_price - nav_raw) / nav_raw) * 100, 2)
+                    if abs(premium) < 30:
+                        results[code] = premium
+                        with _lock:
+                            _premium_cache[code] = premium
+                        # 更新spot中的nav
+                        if code in etf_spot:
+                            with _lock:
+                                etf_spot[code]["nav"] = round(nav_raw, 4)
+                        calc_success += 1
+                        continue
+            
+            # 所有方法都失败：保留历史有效溢价，不从results中写入0
+            # 但如果缓存中已有有效值，将其带入结果
+            with _lock:
+                cached_val = _premium_cache.get(code)
+            if cached_val is not None and cached_val != 0 and abs(cached_val) < 30:
+                results[code] = cached_val
+            skipped_zero += 1
         
         except Exception as e:
             logger.debug(f"溢价获取失败 {code}: {e}")
@@ -1284,7 +1345,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     if results:
         _save_premium_cache()
     
-    logger.info(f"溢价采集完成: 成功 {success}/{len(codes)} 只, 保留历史 {skipped_zero} 只, 总缓存 {len(_premium_cache)} 只")
+    logger.info(f"溢价采集完成: 官方 {success}/{len(codes)} 只, 手动计算 {calc_success}/{len(codes)} 只, 保留历史 {skipped_zero} 只, 总缓存 {len(_premium_cache)} 只")
     return results
 
 
@@ -1834,9 +1895,22 @@ def refresh_spot(force: bool = False) -> None:
         with _lock:
             # 先保留原有所有基金的基本信息
             all_funds = etf_spot.copy()
-            # 用新获取的行情数据更新已有基金
-            for code, data in new_spot.items():
-                all_funds[code] = data
+            # 用新获取的行情数据更新已有基金（智能合并：保留旧数据中的有效值）
+            for code, new_data in new_spot.items():
+                if code in all_funds:
+                    old_data = all_funds[code]
+                    # 智能合并：新数据字段为0/null时保留旧数据中的有效值
+                    for field in ("currentPrice", "chgPct", "scale", "open", "high", "low", "prevClose", "nav", "premium"):
+                        new_val = new_data.get(field)
+                        old_val = old_data.get(field)
+                        # 新数据无有效值但有旧数据有效值时，保留旧值
+                        if (new_val is None or new_val == 0) and old_val is not None and old_val != 0:
+                            new_data[field] = old_val
+                    # 保留旧数据中的费率（新行情数据不包含费率时）
+                    if not new_data.get("fee") and old_data.get("fee"):
+                        new_data["fee"] = old_data["fee"]
+                        new_data["feeDetail"] = old_data.get("feeDetail", "")
+                all_funds[code] = new_data
             # 确保所有已经发现的基金都在列表里，即使没有行情数据
             for code, fund_info in all_funds.items():
                 # 没有行情数据的基金保留基本信息，其他字段设为默认值
@@ -2278,12 +2352,12 @@ async def get_etf_data():
             row.setdefault("feeDetail", "")
             # 添加溢价数据（优先使用缓存中的有效数据，避免异步更新不及时的问题）
             cached_premium = _premium_cache.get(code)
-            if cached_premium is not None and cached_premium != 0:
+            if cached_premium is not None and abs(cached_premium) < 30:
                 row["premium"] = round(cached_premium, 2)
             else:
                 # 缓存没有有效数据，使用spot中的数据（如果有）
                 spot_premium = spot.get("premium")
-                if spot_premium is not None and spot_premium != 0:
+                if spot_premium is not None and abs(spot_premium) < 30:
                     row["premium"] = round(spot_premium, 2)
                 else:
                     row["premium"] = None
