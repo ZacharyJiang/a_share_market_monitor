@@ -83,6 +83,7 @@ docker run -d \
     --name a-share-etf-monitor \
     --restart unless-stopped \
     -p 127.0.0.1:8081:8080 \
+    -v "$(pwd)/data:/app/data" \
     --env-file .env \
     -e USE_MOCK=false \
     a-share-etf-monitor || {

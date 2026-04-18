@@ -1201,36 +1201,7 @@ def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
     return result
 
 
-def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
-    """Fetch ETF premium/discount rate from Eastmoney"""
-    for secid in _secid_candidates(code):
-        try:
-            # 使用分时数据接口获取溢价率
-            url = f"https://push2.eastmoney.com/api/qt/stock/get"
-            params = {
-                "secid": secid,
-                "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f170,f171,f172,f173,f174,f175,f176,f177,f178,f179,f180,f181,f182,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192,f193,f194,f195,f196,f197,f198,f199,f200,f201,f202,f203,f204,f205,f206,f207,f208,f209,f210,f211,f212,f213,f214,f215,f216,f217,f218,f219,f220,f221,f222,f223,f224,f225,f226,f227,f228,f229,f230,f231,f232,f233,f234,f235,f236,f237,f238,f239,f240,f241,f242,f243,f244,f245,f246,f247,f248,f249,f250,f251,f252,f253,f254,f255,f256,f257,f258,f259,f260,f261,f262,f263,f264,f265,f266,f267,f268,f269,f270,f271,f272,f273,f274,f275,f276,f277,f278,f279,f280,f281,f282,f283,f284,f285,f286,f287,f288,f289,f290,f291,f292,f293,f294,f295,f296,f297,f298,f299,f300",
-            }
-            payload = _request_json(url, params, retries=1)
-            if not payload or not payload.get("data"):
-                continue
-            
-            data = payload.get("data", {})
-            # f184 是溢价率字段
-            premium = data.get("f184")
-            if premium is not None:
-                premium_val = _safe_float(premium)
-                if premium_val != 0 or data.get("f43"):  # 确保有数据
-                    with _lock:
-                        _premium_cache[code] = premium_val
-                        _save_premium_cache()
-                    logger.debug("Updated premium for %s: %.2f%%", code, premium_val)
-                    return premium_val
-            
-        except Exception as exc:
-            logger.debug("Fetch premium failed for %s: %s", code, exc)
-    
-    return None
+
 
 
 def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
