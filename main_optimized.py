@@ -1537,9 +1537,18 @@ def _should_refresh_spot(force: bool = False) -> bool:
     # 交易时间必须刷新
     if is_trading_time():
         return True
-    # 非交易时间每30分钟刷新一次（确保更新时间不会停在15点）
-    now = datetime.now(BEIJING_TZ)
-    return now.minute % 30 == 0  # 每小时的0分和30分刷新一次非交易时间数据
+    # 非交易时间：基于 last_updated 判断是否需要刷新
+    # 如果 last_updated 为空，说明还没刷新过，需要刷新
+    if not last_updated:
+        return True
+    # 如果距离上次刷新已超过30分钟，则需要刷新
+    try:
+        last_time = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
+        elapsed = (datetime.now(BEIJING_TZ) - last_time).total_seconds()
+        return elapsed >= 1800  # 30分钟 = 1800秒
+    except (ValueError, TypeError):
+        # 解析失败，默认需要刷新
+        return True
 
 
 def _should_update_kline(code: str, force: bool = False) -> bool:
