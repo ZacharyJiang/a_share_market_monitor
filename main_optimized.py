@@ -2493,6 +2493,13 @@ async def diag():
                 break
             sample.append({**spot, "stats": etf_stats.get(code, {})})
 
+    # 测试fundgz接口在当前环境是否可用
+    fundgz_test = None
+    try:
+        fundgz_test = _fetch_nav_from_fundgz("510050")
+    except Exception as e:
+        fundgz_test = f"error: {e}"
+
     return {
         "current_source": data_source,
         "provider": live_provider,
@@ -2502,6 +2509,8 @@ async def diag():
         "updated": last_updated,
         "rate_limiter": request_controller.status(),
         "sample_etfs": sample,
+        "fundgz_test": {"code": "510050", "nav": fundgz_test},
+        "premium_cache_size": len(_premium_cache),
     }
 
 
