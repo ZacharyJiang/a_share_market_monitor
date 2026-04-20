@@ -1,5 +1,44 @@
 # Market Monitor 24h Watchdog - 执行记录
 
+## 2026-04-20 12:35 执行（第8次）
+
+### 检查结果
+- 网站前端正常可访问 (HTTP 200)
+- ETF总数1889只 ✅
+- 价格(currentPrice)93.8%有效 ✅
+- 指数数据正常（上证4078、深证14975、沪深3004754）✅
+- Sparkline 94.4%有效 ✅
+- **溢价率(premium)100%为null** ❌（持续8次监控未修复）
+- 净值(nav)100%缺失 ❌
+- 费率72.9%有效 ⚠️
+- 数据更新时间 11:31:03 ✅（正常更新中）
+- rate_limiter: state=closed, interval=11.05, failure_streak=4 ⚠️
+
+### 新的修复策略
+之前的fundgz/trends2方案在Docker容器内不可用。新策略：**重新启用列表API的f183/f184字段**。
+
+修改内容（commit dc8e547）：
+1. `_parse_spot_row` 中恢复使用列表API的f183(净值)/f184(溢价率)字段
+2. 校验逻辑：f184非0且abs<30视为有效溢价率；f183>0且<10000视为有效净值
+3. 溢价率来源优先级：列表API f184 > premium_cache > fundgz/trends2
+4. 非交易时间f184为0时，保留premium_cache中的历史值
+5. diag端点新增clist_f184_test字段，用于诊断列表API的f183/f184原始值
+
+### 部署状态
+- commit dc8e547已推送GitHub
+- webhook已触发（auto-update.sh）
+- **等待2分钟后确认：新代码未部署**（diag无clist_f184_test/premium_cache_size字段）
+- 服务器仍运行cb5faa5版本（8+次webhook触发均未成功重建容器）
+
+### 关键问题
+- **自动部署在OpenClaw平台下完全不可行**，必须用户手动部署
+- 新代码中的列表API f184方案是否有效，需要在服务器端验证
+- 如果f184在交易时间有效，这将是比fundgz/trends2更可靠的方案（列表API已在获取价格时同时返回）
+
+### 结论
+- **用户必须手动部署！** 通过OpenClaw平台重启容器，或SSH执行docker操作
+- 部署后需验证：diag端点的clist_f184_test字段，确认列表API的f184是否对ETF返回有效溢价率
+
 ## 2026-04-20 08:05 执行（第7次）
 
 ### 检查结果

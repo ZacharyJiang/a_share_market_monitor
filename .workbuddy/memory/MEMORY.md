@@ -33,6 +33,7 @@
 - **重大发现(2026-04-20)**: 东方财富单条股票API对ETF的f183/f184**始终返回0**，即使fltt=2也无效！该接口仅对股票有效，对ETF无效。之前的fltt=2修复方案对ETF溢价率问题毫无作用
 - **fundgz接口(2026-04-20)**: fundgz.1234567.com.cn在Docker容器内无法访问（DNS解析失败），不能作为净值数据源
 - **IOPV方案(2026-04-20)**: 东方财富trends2接口(`push2.eastmoney.com/api/qt/stock/trends2/get`)的分时数据最后一个字段是IOPV(ETF参考净值)，这是目前发现的唯一可靠ETF净值获取方案
+- **列表API f184方案(2026-04-20)**: 重新启用列表API的f184(溢价率)字段，在fltt=2条件下f184对ETF可能有效。修复commit dc8e547，但未部署。关键诊断：需在服务器端通过clist_f184_test验证f184的实际返回值
 
 ## 部署注意
 - webhook-server.py 运行在宿主机 8082 端口
