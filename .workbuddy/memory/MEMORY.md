@@ -29,9 +29,12 @@
 - refresh_spot 旧逻辑直接覆盖数据，导致非交易时间获取的空数据覆盖了有效数据
 - **关键bug**: 东方财富单条股票API (`push2.eastmoney.com/api/qt/stock/get`) 缺少 `fltt=2` 参数时，f43/f183 返回放大1000倍的整数；代码只对f43做了/1000处理，遗漏了f183(nav) (2026-04-19修复)
 - 自动部署(auto-update.sh)在OpenClaw平台环境下可能无法正常重启Docker容器，需要用户手动介入
+- **非交易时间刷新bug**: `_should_refresh_spot` 用 `now.minute % 30 == 0` 判断是否刷新，但APScheduler的interval模式无法保证命中0/30分，导致数据可能长时间不刷新 (2026-04-19修复为基于last_updated时间差判断)
 
 ## 部署注意
 - webhook-server.py 运行在宿主机 8082 端口
 - 应用容器映射到宿主机 8081 端口
 - nginx 将 /webhook 代理到 8082，其他代理到 8081
 - auto-update.sh 可能与 OpenClaw 平台的 Docker 管理机制不兼容，部署可能需要手动操作
+- **确认**: auto-update.sh 在OpenClaw平台下完全无法工作（4次webhook触发均未成功重建容器），需要找到替代部署方案
+- 宿主机webhook-server.py的REPO_PATH已正确配置为 /root/.openclaw/workspace_coder/a_share_market_monitor/（从webhook返回的日志路径确认）

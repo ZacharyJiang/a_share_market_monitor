@@ -718,15 +718,10 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
     fee_detail = _get_fee_detail(code)
     fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
-    # 从列表API中提取净值(f183)和溢价率(f184)
-    # fltt=2 时，f183返回实际净值（如4.75），f184返回溢价率百分比（如0.52）
-    nav = _safe_float(row.get("f183"))
-    premium = _safe_float(row.get("f184"))
-    # f184=0可能表示无数据（非交易时间），需要区分
-    # 只有当f184有意义的非零值时才使用，或者价格和净值都有效时手动计算
-    if premium == 0 and price > 0 and nav > 0 and abs(price - nav) > 0.0001:
-        # 列表API的溢价率为0但价格和净值不同，手动计算
-        premium = round(((price - nav) / nav) * 100, 2)
+    # 注意：列表API的f183/f184对ETF不可靠
+    # f183在列表API中不是净值（返回负数/涨跌幅），f184也不准确
+    # 溢价率和净值数据改由 _fetch_premium_batch_sync (使用fundgz接口) 单独获取
+    # 不再从列表API中提取nav和premium，避免错误数据
 
     result = {
         "code": code,
@@ -743,14 +738,14 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         "low": round(_safe_float(row.get("f16")), 4),
         "prevClose": round(_safe_float(row.get("f18")), 4),
     }
-    # 添加净值和溢价数据（仅当有效时）
-    if nav > 0:
-        result["nav"] = round(nav, 4)
-    if premium != 0 and abs(premium) < 30:
-        result["premium"] = round(premium, 2)
-        # 同步更新溢价缓存
-        with _lock:
-            _premium_cache[code] = round(premium, 2)
+    # 添加缓存中的溢价和净值数据（由 _fetch_premium_batch_sync 通过fundgz接口获取）
+    with _lock:
+        cached_premium = _premium_cache.get(code)
+        cached_nav = etf_spot.get(code, {}).get("nav") if code in etf_spot else None
+    if cached_nav is not None and cached_nav != 0:
+        result["nav"] = round(cached_nav, 4) if isinstance(cached_nav, float) else cached_nav
+    if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
+        result["premium"] = round(cached_premium, 2)
 
     return result
 
@@ -939,36 +934,44 @@ def _fetch_indices_from_sina() -> List[Dict]:
 
 def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
     """
-    从东方财富获取 ETF 溢价率数据。
-    返回溢价率百分比（如 0.5 表示溢价 0.5%），None 表示获取失败或非交易时间无数据。
+    获取 ETF 溢价率数据。
+    优先使用 fundgz 接口获取实时估值，回退到东方财富单条接口。
     
-    修复：f184=0 或 f183=0 时返回 None（非交易时间），不返回 0！
-    修复：添加 fltt=2 参数，并对 f43/f183 做放大1000倍的安全判断。
+    修复记录(2026-04-20)：
+    - 东方财富单条股票API对ETF的f183/f184始终返回0，不可靠
+    - 改用 fundgz 接口获取实时估值(gsz)，结合价格计算溢价率
     """
+    # 方法1：fundgz接口（首选，对ETF最可靠）
+    fundgz_nav = _fetch_nav_from_fundgz(code)
+    if fundgz_nav and fundgz_nav > 0:
+        with _lock:
+            spot_price = etf_spot.get(code, {}).get("currentPrice", 0)
+        if spot_price > 0:
+            premium = ((spot_price - fundgz_nav) / fundgz_nav) * 100
+            if abs(premium) < 30:
+                return round(premium, 2)
+    
+    # 方法2：东方财富单条接口（备用，对大部分ETF无效但保留兼容性）
     for secid in _secid_candidates(code):
         try:
             url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
                 "secid": secid,
-                "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f169,f170,f171,f172,f173,f177,f183,f184,f185,f186,f187,f188,f189,f190",
+                "fields": "f43,f57,f58,f170,f183,f184",
                 "ut": "7eea3edcaed734bea9cbfc24409ed989",
-                "fltt": "2",  # 关键修复：添加fltt=2让API返回实际值
+                "fltt": "2",
             }
             payload = _request_json(url, params, retries=1)
             data = payload.get("data")
             if not data:
                 continue
             
-            # f184 是溢价率字段（百分比）
-            # 关键修复：f184=0 说明非交易时间或API未更新，返回 None 而不是 0
             f184_val = _safe_float(data.get("f184"))
             if f184_val is not None and f184_val != 0 and abs(f184_val) < 30:
                 return round(f184_val, 2)
             
-            # 如果 f184 没有，尝试计算：溢价率 = (市价 - 净值) / 净值 * 100
-            # fltt=2 时通常返回实际值，但保险起见做放大1000倍的判断
-            price_raw = _safe_float(data.get("f43"))  # 当前价
-            nav_raw = _safe_float(data.get("f183"))   # 单位净值
+            price_raw = _safe_float(data.get("f43"))
+            nav_raw = _safe_float(data.get("f183"))
             
             price = price_raw / 1000 if price_raw > 100 else price_raw
             nav = nav_raw / 1000 if nav_raw > 100 else nav_raw
@@ -1231,13 +1234,72 @@ def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
 
 
 
+def _fetch_nav_from_fundgz(code: str, session: requests.Session = None) -> Optional[float]:
+    """
+    从 fundgz.1234567.com.cn 获取ETF的实时估值(gsz)。
+    
+    该接口专为基金设计，能可靠返回ETF的：
+    - dwjz: 单位净值（昨日收盘净值）
+    - gsz: 实时估值（IOPV参考净值，交易时间内更新）
+    - gszzl: 估值涨跌幅
+    
+    返回 gsz（实时估值）作为ETF的参考净值，用于计算溢价率。
+    如果 gsz 无效则回退到 dwjz。
+    """
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Referer": "https://fund.eastmoney.com/"
+        })
+    
+    try:
+        url = f"http://fundgz.1234567.com.cn/js/{code}.js"
+        resp = session.get(url, timeout=5)
+        if resp.status_code != 200:
+            return None
+        
+        text = resp.text
+        # 解析 jsonpgz({...}) 格式
+        import re
+        match = re.search(r'jsonpgz\((.+?)\)', text)
+        if not match:
+            return None
+        
+        data = json.loads(match.group(1))
+        
+        # 优先使用 gsz（实时估值/IOPV），它是交易时间内的参考净值
+        gsz = _safe_float(data.get("gsz"))
+        dwjz = _safe_float(data.get("dwjz"))
+        
+        # 验证估值合理性
+        if gsz and gsz > 0 and gsz < 10000:
+            return gsz
+        
+        # 回退到单位净值
+        if dwjz and dwjz > 0 and dwjz < 10000:
+            return dwjz
+        
+        return None
+    except Exception as e:
+        logger.debug(f"fundgz获取净值失败 {code}: {e}")
+        return None
+
+
 def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     """
     同步批量获取ETF溢价率数据。
-    废弃不可靠的批量接口f184字段，改用单条股票接口获取准确溢价率，和东方财富APP完全对齐
     
-    关键修复：非交易时间f184返回0时，尝试用f43(价格)和f183(净值)手动计算溢价。
-    如果价格和净值也无法获取，保留历史有效值，不覆盖为0！
+    核心策略：使用 fundgz.1234567.com.cn 接口获取ETF实时估值(gsz)和单位净值(dwjz)，
+    结合spot中的currentPrice计算溢价率。
+    
+    修复记录(2026-04-20)：
+    - 东方财富 push2.eastmoney.com/api/qt/stock/get 对ETF的f183(净值)和f184(溢价率)始终返回0
+    - 即使添加fltt=2参数也无济于事，该接口仅对股票有效，对ETF无效
+    - 改用 fundgz 接口，该接口专为基金设计，能可靠返回ETF的实时估值和净值
+    
+    溢价率 = (currentPrice - gsz) / gsz * 100
+    其中 gsz 是基金实时估值（IOPV），等同于ETF的参考净值
     """
     results = {}
     if not codes:
@@ -1246,122 +1308,78 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/"
+        "Referer": "https://fund.eastmoney.com/"
     })
     
-    success = 0
-    calc_success = 0
-    skipped_zero = 0
+    fundgz_success = 0
+    em_success = 0
+    skipped = 0
     for idx, code in enumerate(codes):
         try:
-            secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
-            url = "https://push2.eastmoney.com/api/qt/stock/get"
-            params = {
-                "secid": secid,
-                "fields": "f43,f44,f45,f46,f47,f57,f58,f170,f183,f184",
-                "ut": "7eea3edcaed734bea9cbfc24409ed989",
-                "fltt": "2",  # 关键修复：添加fltt=2让API返回实际值（小数），而不是放大1000倍的整数
-            }
-            
-            resp = session.get(url, params=params, timeout=5)
-            if resp.status_code != 200:
-                continue
-            
-            data = resp.json().get("data", {})
-            if not data:
-                continue
-            
-            # 方法1：获取官方溢价率 f184
-            f184 = _safe_float(data.get("f184"))
-            if f184 is not None and f184 != 0 and abs(f184) < 30:
-                premium = round(f184, 2)
-                results[code] = premium
-                with _lock:
-                    _premium_cache[code] = premium
-                success += 1
-                # 同时更新spot中的nav
-                nav_raw_1 = _safe_float(data.get("f183"))
-                nav_1 = nav_raw_1 / 1000 if nav_raw_1 > 100 else nav_raw_1
-                if nav_1 > 0 and code in etf_spot:
-                    with _lock:
-                        etf_spot[code]["nav"] = round(nav_1, 4)
-                continue
-            
-            # 方法2：用价格(f43)和净值(f183)手动计算溢价
-            # fltt=2 时 f43 和 f183 返回实际值（小数）
-            # 但保险起见，仍然做放大1000倍的判断
-            price_raw = _safe_float(data.get("f43"))
-            nav_raw = _safe_float(data.get("f183"))
-            
-            # f43 可能是放大1000倍的价格（东方财富API特性）
-            # fltt=2 通常返回实际价格，但某些情况下可能仍是放大值
-            price = 0.0
-            if price_raw > 100:
-                # 大于100说明是放大了1000倍（如4739 -> 4.739）
-                price = price_raw / 1000
-            elif price_raw > 0:
-                # 可能已经是实际价格
-                price = price_raw
-            
-            # f183 净值同样可能被放大1000倍
-            # 修复：对净值也做放大1000倍的判断（之前遗漏了这个处理）
-            nav = 0.0
-            if nav_raw > 100:
-                # 大于100说明是放大了1000倍（如4750 -> 4.750）
-                nav = nav_raw / 1000
-            elif nav_raw > 0:
-                nav = nav_raw
-            
-            if price > 0 and nav > 0:
-                premium = round(((price - nav) / nav) * 100, 2)
-                if abs(premium) < 30:
-                    results[code] = premium
-                    with _lock:
-                        _premium_cache[code] = premium
-                    # 更新spot中的nav
-                    if code in etf_spot:
-                        with _lock:
-                            etf_spot[code]["nav"] = round(nav, 4)
-                    calc_success += 1
-                    continue
-            
-            # 方法3：从spot中获取价格，结合API的净值计算
-            # 使用已处理过的 nav（已除以1000如果需要），而不是原始的 nav_raw
-            if nav > 0:
+            # 方法1（主）：fundgz接口获取ETF实时估值(gsz)和单位净值(dwjz)
+            fundgz_nav = _fetch_nav_from_fundgz(code, session)
+            if fundgz_nav is not None and fundgz_nav > 0:
+                # gsz是实时估值(IOPV)，相当于ETF的参考净值
+                # 溢价率 = (交易价格 - 实时估值) / 实时估值 * 100
                 with _lock:
                     spot_price = etf_spot.get(code, {}).get("currentPrice", 0)
-                if spot_price > 0 and nav > 0:
-                    premium = round(((spot_price - nav) / nav) * 100, 2)
+                if spot_price > 0:
+                    premium = round(((spot_price - fundgz_nav) / fundgz_nav) * 100, 2)
                     if abs(premium) < 30:
                         results[code] = premium
                         with _lock:
                             _premium_cache[code] = premium
-                        # 更新spot中的nav
-                        if code in etf_spot:
-                            with _lock:
-                                etf_spot[code]["nav"] = round(nav, 4)
-                        calc_success += 1
+                            if code in etf_spot:
+                                etf_spot[code]["nav"] = round(fundgz_nav, 4)
+                        fundgz_success += 1
                         continue
+                # 即使没有价格，也更新nav
+                with _lock:
+                    if code in etf_spot:
+                        etf_spot[code]["nav"] = round(fundgz_nav, 4)
             
-            # 所有方法都失败：保留历史有效溢价，不从results中写入0
-            # 但如果缓存中已有有效值，将其带入结果
+            # 方法2（备）：东方财富单条股票接口（对大部分ETF无效，但保留兼容性）
+            secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                "secid": secid,
+                "fields": "f43,f57,f58,f170,f183,f184",
+                "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                "fltt": "2",
+            }
+            try:
+                resp = session.get(url, params=params, timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    if data:
+                        f184 = _safe_float(data.get("f184"))
+                        if f184 is not None and f184 != 0 and abs(f184) < 30:
+                            results[code] = round(f184, 2)
+                            with _lock:
+                                _premium_cache[code] = round(f184, 2)
+                            em_success += 1
+                            continue
+            except Exception:
+                pass  # 备用方法失败不影响主流程
+            
+            # 所有方法都失败：保留历史有效溢价
             with _lock:
                 cached_val = _premium_cache.get(code)
             if cached_val is not None and cached_val != 0 and abs(cached_val) < 30:
                 results[code] = cached_val
-            skipped_zero += 1
+            skipped += 1
         
         except Exception as e:
             logger.debug(f"溢价获取失败 {code}: {e}")
         
-        # 限流控制，每10条请求后暂停2秒（降低频率避免东方财富限流）
-        if (idx + 1) % 10 == 0:
-            time.sleep(2)
+        # 限流控制，每20条请求后暂停1秒（fundgz接口较宽松）
+        if (idx + 1) % 20 == 0:
+            time.sleep(1)
     
     if results:
         _save_premium_cache()
     
-    logger.info(f"溢价采集完成: 官方 {success}/{len(codes)} 只, 手动计算 {calc_success}/{len(codes)} 只, 保留历史 {skipped_zero} 只, 总缓存 {len(_premium_cache)} 只")
+    logger.info(f"溢价采集完成: fundgz {fundgz_success}/{len(codes)} 只, 东方财富 {em_success}/{len(codes)} 只, 保留历史 {skipped} 只, 总缓存 {len(_premium_cache)} 只")
     return results
 
 
