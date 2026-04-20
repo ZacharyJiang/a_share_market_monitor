@@ -1,5 +1,45 @@
 # Market Monitor 24h Watchdog - 执行记录
 
+## 2026-04-20 08:05 执行（第7次）
+
+### 检查结果
+- 网站前端正常可访问 (HTTP 200)
+- ETF总数1889只 ✅（从1886增加，说明服务器在10:11成功部署过一次cb5faa5代码）
+- 价格(currentPrice)92%有效 ✅
+- 指数数据正常（上证4078、深证14967、沪深3004753）✅
+- **溢价率(premium)100%为null** ❌
+- 净值(nav)100%缺失 ❌
+- 数据更新时间正常（持续更新中，不再停滞）✅
+- rate_limiter: state=closed, interval=2.5, failure_streak=0 ✅
+
+### 根因分析（重大发现）
+1. **之前7次监控的溢价率修复方案是错误的**！
+   - 东方财富 `push2.eastmoney.com/api/qt/stock/get` 单条API对ETF的f183(净值)和f184(溢价率)**始终返回0**，即使添加fltt=2参数也无效
+   - 该接口仅对股票有效，对ETF无效。之前4个commit(7856640~cb5faa5)的fltt=2修复对ETF毫无作用
+2. **列表API的f183/f184对ETF也不可靠**
+   - 列表API(fs=b:MK0021)的f183返回负数（不是净值），f184值也异常
+3. **fundgz.1234567.com.cn接口在Docker容器内无法访问**（DNS解析/网络限制）
+4. **东方财富trends2接口可返回IOPV**（分时数据最后一个字段），但尚未确认在Docker容器内是否可用
+
+### 代码修复（5个commit已推送）
+- 00387dc: 重写 `_fetch_premium_batch_sync` 使用fundgz接口获取净值
+- 1554b01: fundgz改用HTTPS+HTTP回退+诊断日志
+- 9bf7571: 添加fundgz接口诊断到diag端点
+- 3e9755d: 优先使用东方财富trends2接口获取IOPV，fundgz作为备用
+- db938b1: 添加trends2接口分步诊断到diag端点
+
+### 部署状态
+- **5个commit全部未部署到服务器！**
+- auto-update.sh累计7次以上失败（webhook触发成功，但docker build/stop/run在OpenClaw平台下无法执行）
+- 服务器仍在运行cb5faa5版本的代码（约10:11时成功部署过一次）
+- 通过diag端点确认：无fundgz_test/trends2_test/premium_cache_size字段
+
+### 结论
+- **必须用户手动部署！** SSH到服务器执行 `docker restart a-share-etf-monitor`，或通过OpenClaw平台重启容器
+- 自动部署方案在OpenClaw平台下确认完全不可行（7+次失败）
+- 一旦手动部署，新代码将使用trends2接口获取IOPV，修复溢价率100%缺失问题
+- 如果trends2在容器内也不可用，需要进一步寻找替代方案
+
 ## 2026-04-20 03:14 执行
 
 ### 检查结果

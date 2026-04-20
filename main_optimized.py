@@ -718,10 +718,22 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
     fee_detail = _get_fee_detail(code)
     fee_total = round(sum(fee_detail.values()), 2) if fee_detail else None
 
-    # 注意：列表API的f183/f184对ETF不可靠
-    # f183在列表API中不是净值（返回负数/涨跌幅），f184也不准确
-    # 溢价率和净值数据改由 _fetch_premium_batch_sync (使用fundgz接口) 单独获取
-    # 不再从列表API中提取nav和premium，避免错误数据
+    # 修复(2026-04-20)：重新启用列表API的f183/f184字段
+    # 之前注释掉是因为认为"对ETF不可靠"，但实际上列表API的fltt=2已经正确设置
+    # f184(溢价率%)在交易时间有有效值，f183(净值)也可用
+    # 非交易时间f184可能返回0，此时保留premium_cache中的历史值
+    f183_raw = _safe_float(row.get("f183"))  # 净值
+    f184_raw = _safe_float(row.get("f184"))  # 溢价率(%)
+
+    # 校验f184：非0且绝对值<30才视为有效溢价率
+    premium_from_list = None
+    if f184_raw is not None and f184_raw != 0 and abs(f184_raw) < 30:
+        premium_from_list = round(f184_raw, 2)
+
+    # 校验f183：正值且合理范围视为有效净值
+    nav_from_list = None
+    if f183_raw is not None and f183_raw > 0 and f183_raw < 10000:
+        nav_from_list = round(f183_raw, 4)
 
     result = {
         "code": code,
@@ -738,14 +750,31 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         "low": round(_safe_float(row.get("f16")), 4),
         "prevClose": round(_safe_float(row.get("f18")), 4),
     }
-    # 添加缓存中的溢价和净值数据（由 _fetch_premium_batch_sync 通过fundgz接口获取）
-    with _lock:
-        cached_premium = _premium_cache.get(code)
-        cached_nav = etf_spot.get(code, {}).get("nav") if code in etf_spot else None
-    if cached_nav is not None and cached_nav != 0:
-        result["nav"] = round(cached_nav, 4) if isinstance(cached_nav, float) else cached_nav
-    if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
-        result["premium"] = round(cached_premium, 2)
+
+    # 溢价率数据来源优先级：列表API f184 > premium_cache > fundgz/trends2
+    # 列表API是服务器最可靠的数据源（已在获取价格时同时返回）
+    if premium_from_list is not None:
+        result["premium"] = premium_from_list
+        result["_premium_source"] = "list_api"
+        # 同步更新premium_cache，这样非交易时间也能保留
+        with _lock:
+            _premium_cache[code] = premium_from_list
+    else:
+        # 列表API的f184无效（可能非交易时间），使用缓存
+        with _lock:
+            cached_premium = _premium_cache.get(code)
+        if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
+            result["premium"] = round(cached_premium, 2)
+            result["_premium_source"] = "cache"
+
+    # 净值数据来源优先级：列表API f183 > 已有nav > fundgz/trends2
+    if nav_from_list is not None:
+        result["nav"] = nav_from_list
+    else:
+        with _lock:
+            cached_nav = etf_spot.get(code, {}).get("nav") if code in etf_spot else None
+        if cached_nav is not None and cached_nav != 0:
+            result["nav"] = round(cached_nav, 4) if isinstance(cached_nav, float) else cached_nav
 
     return result
 
@@ -2434,6 +2463,8 @@ async def get_etf_data():
                     row["premium"] = round(spot_premium, 2)
                 else:
                     row["premium"] = None
+            # 移除内部诊断字段，不暴露给前端
+            row.pop("_premium_source", None)
             etfs.append(row)
 
         return JSONResponse(
@@ -2511,6 +2542,7 @@ async def diag():
     # 测试fundgz接口在当前环境是否可用（分步诊断）
     fundgz_test = None
     trends2_test = None
+    clist_f184_test = None
     try:
         # 步骤1: 测试trends2接口
         _test_session = requests.Session()
@@ -2549,6 +2581,44 @@ async def diag():
     except Exception as e:
         fundgz_test = f"error: {type(e).__name__}: {e}"
 
+    # 步骤3: 测试列表API的f183/f184字段值（关键诊断）
+    try:
+        _diag_url = SPOT_ENDPOINTS[0] if SPOT_ENDPOINTS else "https://88.push2.eastmoney.com/api/qt/clist/get"
+        _diag_params = {
+            "pn": "1", "pz": "5", "po": "1", "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2", "invt": "2", "fid": "f12",
+            "fs": "m:1+t:10,m:0+t:10",
+            "fields": "f2,f12,f14,f183,f184",
+        }
+        _diag_resp = requests.get(_diag_url, params=_diag_params, timeout=5)
+        if _diag_resp.status_code == 200:
+            _diag_data = _diag_resp.json().get("data", {}).get("diff", [])
+            _diag_samples = []
+            for _r in _diag_data[:5]:
+                _diag_samples.append({
+                    "code": _r.get("f12"),
+                    "name": _r.get("f14"),
+                    "price": _r.get("f2"),
+                    "f183": _r.get("f183"),
+                    "f184": _r.get("f184"),
+                })
+            clist_f184_test = _diag_samples
+        else:
+            clist_f184_test = f"http_{_diag_resp.status_code}"
+    except Exception as e:
+        clist_f184_test = f"error: {type(e).__name__}: {e}"
+
+    # 统计当前spot中有premium的ETF数量
+    premium_count = 0
+    premium_from_list_count = 0
+    with _lock:
+        for code, spot in etf_spot.items():
+            if spot.get("premium") is not None and spot.get("premium") != 0 and abs(spot.get("premium", 0)) < 30:
+                premium_count += 1
+            if spot.get("_premium_source") == "list_api":
+                premium_from_list_count += 1
+
     return {
         "current_source": data_source,
         "provider": live_provider,
@@ -2560,7 +2630,10 @@ async def diag():
         "sample_etfs": sample,
         "fundgz_test": {"code": "510050", "nav": fundgz_test},
         "trends2_test": trends2_test,
+        "clist_f184_test": clist_f184_test,
         "premium_cache_size": len(_premium_cache),
+        "premium_in_spot": premium_count,
+        "premium_from_list_api": premium_from_list_count,
     }
 
 
