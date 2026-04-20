@@ -1236,61 +1236,76 @@ def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
 
 def _fetch_nav_from_fundgz(code: str, session: requests.Session = None) -> Optional[float]:
     """
-    从 fundgz.1234567.com.cn 获取ETF的实时估值(gsz)。
+    获取ETF的实时IOPV（参考净值），用于计算溢价率。
     
-    该接口专为基金设计，能可靠返回ETF的：
-    - dwjz: 单位净值（昨日收盘净值）
-    - gsz: 实时估值（IOPV参考净值，交易时间内更新）
-    - gszzl: 估值涨跌幅
+    策略优先级：
+    1. 东方财富 trends2 接口 — 获取分时行情中的IOPV值（最后字段），在Docker容器内可访问
+    2. fundgz 接口 — 备用，在部分网络环境可能不可用
     
-    返回 gsz（实时估值）作为ETF的参考净值，用于计算溢价率。
-    如果 gsz 无效则回退到 dwjz。
+    修复记录(2026-04-20)：
+    - fundgz.1234567.com.cn 在Docker容器内无法访问（DNS解析/网络限制）
+    - 东方财富 push2 单条股票API对ETF的f183/f184始终返回0
+    - 发现 trends2 接口的分时数据最后一个字段是IOPV，可靠且在容器内可访问
     """
     if session is None:
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Referer": "https://fund.eastmoney.com/"
+            "Referer": "https://quote.eastmoney.com/"
         })
     
+    # 方法1（主）：东方财富trends2接口获取IOPV
     try:
-        # 优先使用HTTPS，部分Docker环境可能阻止HTTP请求
+        secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+        url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "fltt": "2",
+            "ndays": "1",  # 只获取当天数据
+        }
+        resp = session.get(url, params=params, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            trends = data.get("trends", [])
+            if trends:
+                # 取最后一条记录，最后一个字段是IOPV
+                last_trend = trends[-1]
+                parts = str(last_trend).split(",")
+                if len(parts) >= 8:
+                    iopv = _safe_float(parts[-1])
+                    if iopv and iopv > 0 and iopv < 10000:
+                        return iopv
+    except Exception as e:
+        logger.debug(f"trends2获取IOPV失败 {code}: {e}")
+    
+    # 方法2（备）：fundgz接口
+    try:
         url = f"https://fundgz.1234567.com.cn/js/{code}.js"
         try:
             resp = session.get(url, timeout=5)
         except Exception:
-            # HTTPS失败时回退到HTTP
             url = f"http://fundgz.1234567.com.cn/js/{code}.js"
             resp = session.get(url, timeout=5)
             
-        if resp.status_code != 200:
-            return None
-        
-        text = resp.text
-        # 解析 jsonpgz({...}) 格式
-        import re
-        match = re.search(r'jsonpgz\((.+?)\)', text)
-        if not match:
-            return None
-        
-        data = json.loads(match.group(1))
-        
-        # 优先使用 gsz（实时估值/IOPV），它是交易时间内的参考净值
-        gsz = _safe_float(data.get("gsz"))
-        dwjz = _safe_float(data.get("dwjz"))
-        
-        # 验证估值合理性
-        if gsz and gsz > 0 and gsz < 10000:
-            return gsz
-        
-        # 回退到单位净值
-        if dwjz and dwjz > 0 and dwjz < 10000:
-            return dwjz
-        
-        return None
+        if resp.status_code == 200:
+            text = resp.text
+            import re
+            match = re.search(r'jsonpgz\((.+?)\)', text)
+            if match:
+                data = json.loads(match.group(1))
+                gsz = _safe_float(data.get("gsz"))
+                dwjz = _safe_float(data.get("dwjz"))
+                if gsz and gsz > 0 and gsz < 10000:
+                    return gsz
+                if dwjz and dwjz > 0 and dwjz < 10000:
+                    return dwjz
     except Exception as e:
         logger.debug(f"fundgz获取净值失败 {code}: {e}")
-        return None
+    
+    return None
 
 
 def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
@@ -1312,14 +1327,14 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     if not codes:
         return results
     
-    # 诊断：测试fundgz接口是否可用
+    # 诊断：测试IOPV接口是否可用
     _test_nav = _fetch_nav_from_fundgz("510050")
-    logger.info(f"溢价采集诊断: fundgz接口测试510050, nav={_test_nav}, 接口{'可用' if _test_nav else '不可用'}")
+    logger.info(f"溢价采集诊断: IOPV接口测试510050, nav={_test_nav}, 接口{'可用' if _test_nav else '不可用'}")
     
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://fund.eastmoney.com/"
+        "Referer": "https://quote.eastmoney.com/"
     })
     
     fundgz_success = 0
