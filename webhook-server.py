@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify
 
 # 配置
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-REPO_PATH = os.environ.get("REPO_PATH", "/opt/market_monitor_openclaw_cloud")
+REPO_PATH = os.environ.get("REPO_PATH", "/root/.openclaw/workspace_coder/a_share_market_monitor")
 LOG_FILE = os.path.join(REPO_PATH, "logs", "webhook-server.log")
 
 # 设置日志
