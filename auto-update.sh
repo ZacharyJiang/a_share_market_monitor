@@ -56,7 +56,7 @@ nohup "$PYTHON_BIN" "$UVICORN_BIN" main_optimized:app \
     >> "$APP_LOG" 2>&1 &
 
 NEW_PID=$!
-sleep 2
+sleep 8
 
 if kill -0 "$NEW_PID" 2>/dev/null; then
     echo "[SUCCESS] 新进程启动成功 PID=$NEW_PID"
