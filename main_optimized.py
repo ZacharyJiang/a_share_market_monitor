@@ -671,13 +671,13 @@ def _calc_scale(row: Dict) -> float:
     if total_mv > 1e6:
         return round(total_mv / 1e8, 2)
     if total_mv > 0:
-        return round(total_mv, 2)
+        return round(total_mv / 1e4, 2)
 
     flow_mv = _safe_float(row.get("f21"))
     if flow_mv > 1e6:
         return round(flow_mv / 1e8, 2)
     if flow_mv > 0:
-        return round(flow_mv, 2)
+        return round(flow_mv / 1e4, 2)
 
     turnover = _safe_float(row.get("f6"))
     if turnover > 0:
@@ -2440,12 +2440,11 @@ async def get_etf_data():
                     row["fee"] = round(sum(fee_detail.values()), 2)
                     row["feeDetail"] = _format_fee_detail(fee_detail)
             row.setdefault("feeDetail", "")
-            # 添加溢价数据（优先使用缓存中的有效数据，避免异步更新不及时的问题）
-            cached_premium = _premium_cache.get(code)
-            if cached_premium is not None and abs(cached_premium) < 30:
-                row["premium"] = round(cached_premium, 2)
+            # 溢价：优先使用 get_premium_for_display（含非交易时段收盘回退逻辑）
+            display_premium = get_premium_for_display(code)
+            if display_premium is not None and abs(display_premium) < 30:
+                row["premium"] = round(display_premium, 2)
             else:
-                # 缓存没有有效数据，使用spot中的数据（如果有）
                 spot_premium = spot.get("premium")
                 if spot_premium is not None and abs(spot_premium) < 30:
                     row["premium"] = round(spot_premium, 2)
