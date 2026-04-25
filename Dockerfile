@@ -4,8 +4,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
 ENV REFRESH_MINUTES=2
 ENV KLINE_REFRESH_MINUTES=180
 ENV KLINE_BATCH_SIZE=2
