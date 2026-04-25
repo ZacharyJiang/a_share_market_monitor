@@ -68,6 +68,10 @@ KLINE_BATCH_SIZE = max(1, _env_int("KLINE_BATCH_SIZE", 2))
 KLINE_TOP_N = _env_int("KLINE_TOP_N", 0)
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a96d29ebd8b8dbc6")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "wIfIb03RPikK8EXXBfzfAhZC8WzTOMAn")
+FEISHU_REPORT_OPEN_ID = os.environ.get("FEISHU_REPORT_OPEN_ID", "ou_3a33ed056e2746761d2a33c55a45bd54")
+
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
 API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 2.5)      # 基础间隔从1.2s提升到2.5s，避免触发东方财富限流
 API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 15.0)       # 最大退避间隔提升到15s
@@ -128,6 +132,76 @@ def _save_close_premium_cache():
         _close_premium_cache_file.write_text(json.dumps(_close_premium_cache, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
+
+
+def send_feishu_report() -> None:
+    """每小时发送飞书数据完整度报告"""
+    try:
+        tr = requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+            timeout=10,
+        )
+        token = tr.json().get("tenant_access_token", "")
+        if not token:
+            logger.warning("Feishu report: failed to get token: %s", tr.json())
+            return
+
+        with _lock:
+            spot = dict(etf_spot)
+
+        total = len(spot)
+        if total == 0:
+            logger.warning("Feishu report: no ETF data available")
+            return
+
+        price_ok = sum(1 for e in spot.values() if e.get("currentPrice", 0) > 0)
+        premium_ok = sum(1 for e in spot.values() if e.get("premium") is not None)
+        fee_ok = sum(1 for e in spot.values() if e.get("fee") and e.get("fee", 0) > 0)
+        scale_ok = sum(1 for e in spot.values() if e.get("scale") and e.get("scale", 0) > 0)
+        stats_ok = sum(1 for e in spot.values() if e.get("allTimeHigh"))
+
+        def pct(n: int) -> str:
+            return f"{n}/{total} ({100 * n // total}%)"
+
+        def icon(n: int, warn: int = 85, good: int = 95) -> str:
+            p = 100 * n // total
+            return "✅" if p >= good else ("⚠️" if p >= warn else "❌")
+
+        bj = datetime.now(BEIJING_TZ)
+        t = bj.time()
+        from datetime import time as dtime
+        is_mkt = (dtime(9, 30) <= t <= dtime(11, 30)) or (dtime(13, 0) <= t <= dtime(15, 0))
+        note = "" if is_mkt or premium_ok > 0 else " (非交易时段)"
+
+        lines = [
+            "📊 market-monitor 数据报告",
+            f"🕐 {bj.strftime('%Y-%m-%d %H:%M')} 北京时间",
+            f"数据源: {data_source}  最后更新: {last_updated or '?'}",
+            f"ETF 总数: {total}",
+            "",
+            f"{icon(price_ok)} 价格      {pct(price_ok)}",
+            f"{icon(premium_ok, warn=30, good=60)} 溢价率    {pct(premium_ok)}{note}",
+            f"{icon(fee_ok)} 费率      {pct(fee_ok)}",
+            f"{icon(scale_ok)} 规模      {pct(scale_ok)}",
+            f"{icon(stats_ok)} K线统计   {pct(stats_ok)}",
+        ]
+        msg = "\n".join(lines)
+
+        mr = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            params={"receive_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"receive_id": FEISHU_REPORT_OPEN_ID, "msg_type": "text", "content": json.dumps({"text": msg})},
+            timeout=10,
+        )
+        code = mr.json().get("code")
+        if code == 0:
+            logger.info("Feishu report sent OK")
+        else:
+            logger.warning("Feishu report send failed: %s", mr.json())
+    except Exception as exc:
+        logger.error("Feishu report error: %s", exc)
 
 
 def save_close_premium_at_market_close(session: str = "afternoon"):
@@ -2396,6 +2470,16 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    if FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_REPORT_OPEN_ID:
+        scheduler.add_job(
+            send_feishu_report,
+            "interval",
+            hours=1,
+            id="feishu_report",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("Feishu hourly report scheduled")
     scheduler.start()
 
     # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
