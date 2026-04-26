@@ -779,7 +779,26 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
     nav_value = None
     premium_source = None
 
-    if f402_raw is not None and f402_raw != 0 and abs(f402_raw) < 30:
+    # 非交易时段：nav_cache+当日收盘价 比 Eastmoney 返回的陈旧 f402/f441 更准确，优先使用
+    if not is_trading_time():
+        _nt_nav = _nav_cache.get(code)
+        if _nt_nav and _nt_nav.get("nav", 0) > 0:
+            _nt_nav_val = _nt_nav["nav"]
+            _nt_price = price if price > 0 else 0
+            if _nt_price <= 0:
+                with _lock:
+                    _nt_price = etf_spot.get(code, {}).get("currentPrice") or 0
+            if _nt_price <= 0:
+                _nt_price = _safe_float(row.get("f18"))
+            if _nt_nav_val > 0 and _nt_price > 0:
+                _nt_calc = round(((_nt_price - _nt_nav_val) / _nt_nav_val) * 100, 2)
+                if abs(_nt_calc) < 30:
+                    premium_value = _nt_calc
+                    premium_source = "nav_cache_nontrading"
+                    with _lock:
+                        _premium_cache[code] = premium_value
+
+    if f402_raw is not None and f402_raw != 0 and abs(f402_raw) < 30 and premium_value is None:
         # f402是折价率，溢价率 = -折价率
         premium_value = round(-f402_raw, 2)
         premium_source = "f402_discount"
@@ -1257,21 +1276,16 @@ def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
 # 独立的溢价刷新任务，不依赖spot刷新
 def refresh_all_premium() -> None:
     """
-    刷新所有ETF的溢价数据。
-    - 交易时段：每5分钟执行（由调度器控制）
-    - 非交易时段：最多30分钟执行一次，避免频繁请求
+    刷新所有ETF的溢价数据。仅在交易时段运行；非交易时段溢价由 refresh_nav_batch 在启动时填充。
     """
-    global last_updated, _premium_last_full_refresh
+    global last_updated
     if not etf_spot:
         logger.warning("No ETF spot data available, skipping premium refresh")
         return
 
     if not is_trading_time():
-        now = time.time()
-        if now - _premium_last_full_refresh < 1800:  # 30分钟内已刷新过
-            logger.debug("Skip premium refresh (non-trading, last refresh <30min ago)")
-            return
-    _premium_last_full_refresh = time.time()
+        logger.debug("Skip premium refresh (non-trading, handled by nav_batch)")
+        return
 
     all_codes = list(etf_spot.keys())
     logger.info("Starting full premium refresh for %s ETFs...", len(all_codes))
@@ -2347,11 +2361,13 @@ def refresh_nav_batch() -> None:
                     with _lock:
                         _nav_cache[code] = {"nav": nav, "date": nav_date}
                     done += 1
-                    # 立即用昨收价更新premium缓存（非交易时段也能显示溢价）
-                    prev_close = etf_spot.get(code, {}).get("prevClose", 0) or 0
-                    if prev_close > 0:
-                        calc = round(((prev_close - nav) / nav) * 100, 2)
-                        if abs(calc) < 30 and code not in _premium_cache:
+                    # 用当日收盘价（回退昨收）更新premium缓存，始终覆盖旧值保证准确
+                    ref_price = etf_spot.get(code, {}).get("currentPrice") or 0
+                    if ref_price <= 0:
+                        ref_price = etf_spot.get(code, {}).get("prevClose") or 0
+                    if ref_price > 0:
+                        calc = round(((ref_price - nav) / nav) * 100, 2)
+                        if abs(calc) < 30:
                             with _lock:
                                 _premium_cache[code] = calc
                                 if code in etf_spot:
