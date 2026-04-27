@@ -24,6 +24,7 @@ import subprocess
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -1281,16 +1282,22 @@ def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
 
 def _fetch_scale_via_ulist_batch(codes: List[str]) -> Dict[str, float]:
     """
-    使用 Eastmoney 单条行情后端（ulist.np/get）批量获取最新规模 f117(总市值)。
-    这与 Eastmoney APP/网页报价页一致——比列表 API 的 f441×f38 更新及时
-    （列表 API 的 f38 流通份额对快速申赎的 ETF 存在 T+1 延迟）。
+    使用 Eastmoney 单条行情后端（ulist.np/get）批量获取最新规模。
+    与 APP/网页报价页一致——比列表 API 的 f441×f38 更新及时。
+
+    多字段兜底（按优先级）：
+      f117 (总市值)        — ETF 主力字段
+      f164 (流通市值)      — 部分基金
+      f20  (总市值，list)  — LOF/REIT 兜底
+      f441×f38             — 最后兜底
+    单位检测：> 1e7 视为元，> 0 视为万元；< 0 视为缺失。
 
     每批 50 个 secid，复用全局 _request_json 限流器/熔断器。
-    返回 {code: scale_in_yi_yuan}；失败的批次跳过，不抛错。
     """
     BATCH_SIZE = 50
     url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
     result: Dict[str, float] = {}
+    sample_logged = False
 
     for i in range(0, len(codes), BATCH_SIZE):
         batch = codes[i : i + BATCH_SIZE]
@@ -1300,7 +1307,7 @@ def _fetch_scale_via_ulist_batch(codes: List[str]) -> Dict[str, float]:
         )
         params = {
             "secids": secids,
-            "fields": "f12,f13,f14,f117,f164,f441",
+            "fields": "f12,f13,f14,f20,f38,f117,f164,f441",
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": "2",
             "invt": "2",
@@ -1311,41 +1318,85 @@ def _fetch_scale_via_ulist_batch(codes: List[str]) -> Dict[str, float]:
             logger.warning("Scale ulist batch failed (offset=%d): %s", i, exc)
             continue
 
-        for row in (payload.get("data") or {}).get("diff") or []:
+        diff = (payload.get("data") or {}).get("diff") or []
+        if not diff:
+            logger.warning("Scale ulist batch empty (offset=%d, sent=%d)", i, len(batch))
+            continue
+
+        for row in diff:
             code = str(row.get("f12", "")).zfill(6)
             if not code:
                 continue
-            # f117 = 总市值（元）。LOF/部分品种可能返回 0 或万元单位，过滤掉异常值。
-            f117 = _safe_float(row.get("f117"))
-            if f117 > 1e7:           # > 1000 万元，按元解析
-                result[code] = round(f117 / 1e8, 2)
-            elif f117 > 0:           # 单位疑似万元（罕见），按万元解析
-                result[code] = round(f117 / 1e4, 2)
+
+            scale = _scale_from_row_fields(row)
+            if scale > 0:
+                result[code] = scale
+
+            if not sample_logged:
+                logger.info(
+                    "ulist sample %s: f117=%s f164=%s f20=%s f38=%s f441=%s -> %s",
+                    code, row.get("f117"), row.get("f164"), row.get("f20"),
+                    row.get("f38"), row.get("f441"), scale,
+                )
+                sample_logged = True
 
     return result
 
 
-def refresh_all_scales() -> None:
+def _scale_from_row_fields(row: Dict) -> float:
+    """从一行 secid 返回中按优先级取规模（亿元）。0 表示无法解析。"""
+    # 1) f117 总市值 (主力)
+    f117 = _safe_float(row.get("f117"))
+    if f117 > 1e7:
+        return round(f117 / 1e8, 2)
+    if f117 > 0:
+        return round(f117 / 1e4, 2)
+
+    # 2) f164 流通市值
+    f164 = _safe_float(row.get("f164"))
+    if f164 > 1e7:
+        return round(f164 / 1e8, 2)
+    if f164 > 0:
+        return round(f164 / 1e4, 2)
+
+    # 3) f20 list-API 总市值（极端情况下 LOF 走这条）
+    f20 = _safe_float(row.get("f20"))
+    if f20 > 1e7:
+        return round(f20 / 1e8, 2)
+    if f20 > 0:
+        return round(f20 / 1e4, 2)
+
+    # 4) f441 × f38 最后兜底
+    iopv = _safe_float(row.get("f441"))
+    shares = _safe_float(row.get("f38"))
+    if iopv > 0 and shares > 0:
+        return round(iopv * shares / 1e8, 2)
+
+    return 0.0
+
+
+def refresh_all_scales(force: bool = False) -> None:
     """
-    刷新所有 ETF 的最新规模，使用单条行情后端 f117（与 Eastmoney APP 一致）。
+    刷新所有 ETF/LOF/REIT 的最新规模，使用单条行情后端 f117（与 Eastmoney APP 一致）。
     覆盖 etf_spot[code]['scale']——比 _calc_scale 的 f441×f38 更新及时。
 
     频控：复用全局 _request_json 限流器（API_BASE_INTERVAL=2.5s/次），
-          1000+ ETF / 50 一批 ≈ 20+ 次请求 ≈ 50s 完成。
-    交易日：非交易日跳过（份额无变化，无需刷新）。
+          1500 只 / 50 一批 ≈ 30 次请求 ≈ 75s 完成。
+    交易日：非交易日跳过（份额变化小，无需刷新）；force=True 时绕过此校验
+            （用于启动时无条件修正）。
     """
     if not etf_spot:
         logger.warning("Skip scale refresh (no ETF spot data)")
         return
 
-    if not is_trading_day():
-        logger.debug("Skip scale refresh (non-trading day)")
+    if not force and not is_trading_day():
+        logger.debug("Skip scale refresh (non-trading day, no force)")
         return
 
     with _lock:
         all_codes = list(etf_spot.keys())
 
-    logger.info("Starting scale refresh for %d ETFs via ulist (f117)...", len(all_codes))
+    logger.info("Starting scale refresh for %d funds via ulist (force=%s)...", len(all_codes), force)
     scales = _fetch_scale_via_ulist_batch(all_codes)
 
     updated = 0
@@ -1355,8 +1406,9 @@ def refresh_all_scales() -> None:
             if code not in etf_spot or new_scale <= 0:
                 continue
             old_scale = _safe_float(etf_spot[code].get("scale"))
-            # 仅在差异 > 0.5亿 或原值缺失时更新，避免无意义 IO
-            if not old_scale or abs(new_scale - old_scale) > 0.5:
+            # 差异 > 0.1亿 或原值缺失/为0 时更新（之前 0.5亿 太宽松，
+            # 像 161725 这种实际 21亿 但前端显示 258亿 的反向偏差也要能修正）
+            if not old_scale or abs(new_scale - old_scale) > 0.1:
                 etf_spot[code]["scale"] = new_scale
                 updated += 1
             else:
@@ -2749,9 +2801,16 @@ async def lifespan(app: FastAPI):
         # 先执行基金发现
         _ensure_all_etfs_in_spot()
         logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
-        # 再执行首次行情刷新
+        # 首次行情刷新（_calc_scale 估算的规模可能滞后，下一步会修正）
         refresh_spot(force=True)
-    
+        # 用 ulist f117 修正规模（覆盖 _calc_scale 的滞后估算）。
+        # 必须在 refresh_spot 之后串行执行，避免并发竞态导致 etf_spot 未填充就跳过。
+        # force=True：忽略 is_trading_day 校验，确保部署后无条件跑一次。
+        try:
+            refresh_all_scales(force=True)
+        except Exception as exc:
+            logger.error("Initial scale refresh failed: %s", exc)
+
     threading.Thread(target=startup_init, daemon=True).start()
 
     with _lock:
@@ -2855,25 +2914,20 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
-    # 规模刷新：用单条行情后端 f117(总市值) 覆盖 _calc_scale 的 f441×f38 估算
+    # 规模刷新：用单条行情后端 f117(总市值) 覆盖 _calc_scale 的 f441×f38 估算。
     # 修复 511360 等快速申赎ETF出现 ~30% 偏差的问题。
-    # 内部已校验 is_trading_day()——非交易日自动跳过。
-    # 09:30 BJ (UTC 01:30) — 反映夜盘公告的新份额
+    # 内部已校验 is_trading_day()——非交易日自动跳过；启动时已在 startup_init 串行跑一次。
+    # 显式绑定北京时区，避免依赖服务器 local time（不同部署环境可能 UTC 或 BJT）。
     scheduler.add_job(
         refresh_all_scales,
-        "cron",
-        hour=1,
-        minute=30,
+        CronTrigger(hour=9, minute=35, timezone=BEIJING_TZ),
         id="scale_refresh_morning",
         max_instances=1,
         coalesce=True,
     )
-    # 15:05 BJ (UTC 07:05) — 收盘后当日最终份额
     scheduler.add_job(
         refresh_all_scales,
-        "cron",
-        hour=7,
-        minute=5,
+        CronTrigger(hour=15, minute=5, timezone=BEIJING_TZ),
         id="scale_refresh_close",
         max_instances=1,
         coalesce=True,
@@ -2890,8 +2944,8 @@ async def lifespan(app: FastAPI):
     # 启动时在后台采集NAV，用于填充非交易时段溢价
     threading.Thread(target=refresh_nav_batch, daemon=True).start()
 
-    # 启动时在后台用最新规模覆盖 spot 缓存（仅交易日生效，函数内部已校验）
-    threading.Thread(target=refresh_all_scales, daemon=True).start()
+    # 注：refresh_all_scales 不再独立启动线程——已在 startup_init 中
+    # 串行执行（refresh_spot 之后），避免读 etf_spot 时的竞态。
 
     # Back-fill stats from any existing kline files that lack the new fields
     # (e.g. after a server upgrade where compute_stats gained new columns).
