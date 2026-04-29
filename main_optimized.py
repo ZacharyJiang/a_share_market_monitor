@@ -70,11 +70,12 @@ KLINE_TOP_N = _env_int("KLINE_TOP_N", 0)
 FORCE_REFRESH = _env_bool("FORCE_REFRESH", False)
 
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 12.0)
-API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 2.5)      # 基础间隔从1.2s提升到2.5s，避免触发东方财富限流
-API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 15.0)       # 最大退避间隔提升到15s
+API_BASE_INTERVAL = _env_float("API_BASE_INTERVAL", 5.0)      # 基础间隔 5s，最小化触发东方财富 IP 风控
+API_MAX_INTERVAL = _env_float("API_MAX_INTERVAL", 30.0)       # 最大退避间隔 30s
 SECONDARY_API_INTERVAL = _env_float("SECONDARY_API_INTERVAL", 1.0)  # 新浪接口间隔也提高
 CIRCUIT_BREAKER_THRESHOLD = _env_int("CIRCUIT_BREAKER_THRESHOLD", 4)
 CIRCUIT_BREAKER_COOLDOWN = _env_int("CIRCUIT_BREAKER_COOLDOWN", 180)
+CIRCUIT_BREAKER_MAX_COOLDOWN = _env_int("CIRCUIT_BREAKER_MAX_COOLDOWN", 1800)  # 风控持续时冷却最长 30 分钟
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -353,7 +354,8 @@ class RequestController:
             self.last_request_at = now + wait_time
 
         if wait_time > 0:
-            time.sleep(wait_time + random.uniform(0.02, 0.18))
+            # 大抖动 0.5-2s：降低请求节奏的可识别性，减少 IP 风控触发
+            time.sleep(wait_time + random.uniform(0.5, 2.0))
 
     def record_success(self) -> None:
         with self._lock:
@@ -371,10 +373,14 @@ class RequestController:
                 self.current_interval * 1.45,
             )
             if self.failure_streak >= CIRCUIT_BREAKER_THRESHOLD:
-                self.breaker_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
+                # 渐进冷却：streak 越高冷却越长，避免 IP 风控期间反复触发
+                # base 180s → streak 5: 360s → streak 10: 540s → ... 上限 1800s (30min)
+                multiplier = 1 + (self.failure_streak - CIRCUIT_BREAKER_THRESHOLD) // 2
+                cooldown = min(CIRCUIT_BREAKER_MAX_COOLDOWN, CIRCUIT_BREAKER_COOLDOWN * multiplier)
+                self.breaker_until = time.time() + cooldown
                 logger.warning(
                     "Circuit breaker opened for %ss (failure streak=%s)",
-                    CIRCUIT_BREAKER_COOLDOWN,
+                    cooldown,
                     self.failure_streak,
                 )
 
@@ -1048,6 +1054,41 @@ def _fetch_indices_from_eastmoney() -> List[Dict]:
     return result
 
 
+def _fetch_indices_from_tencent() -> List[Dict]:
+    """Tencent 指数源 (qt.gtimg.cn)，作为 Eastmoney/Sina 都失败时的兜底。"""
+    targets = [("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sh000300", "沪深300")]
+    query = ",".join(s for s, _ in targets)
+    text = _request_text_sina(
+        f"https://qt.gtimg.cn/q={query}",
+        params={},
+        retries=2,
+        headers={"Referer": "https://stockapp.finance.qq.com"},
+    )
+    name_map = dict(targets)
+    result = []
+    for line in text.strip().split("\n"):
+        if "~" not in line:
+            continue
+        # 形如: v_sh000001="1~上证指数~000001~3300.12~prev_close~open~..."
+        left, _, right = line.partition("=")
+        symbol = left.replace("v_", "").strip()
+        if symbol not in name_map:
+            continue
+        parts = right.strip().strip(';').strip('"').split("~")
+        if len(parts) < 6:
+            continue
+        try:
+            val = float(parts[3]) if parts[3] else 0.0
+            prev = float(parts[4]) if parts[4] else 0.0
+        except ValueError:
+            continue
+        if val <= 0:
+            continue
+        chg_pct = round((val - prev) / prev * 100, 2) if prev > 0 else 0.0
+        result.append({"name": name_map[symbol], "val": round(val, 2), "chg": chg_pct})
+    return result
+
+
 def _fetch_indices_from_sina() -> List[Dict]:
     text = _request_text_sina(
         SINA_INDEX_URL,
@@ -1504,6 +1545,13 @@ def fetch_indices_live() -> Tuple[str, List[Dict]]:
             return "sina", indices
     except Exception as exc:
         logger.warning("Index fetch (Sina) failed: %s", exc)
+
+    try:
+        indices = _fetch_indices_from_tencent()
+        if indices:
+            return "tencent", indices
+    except Exception as exc:
+        logger.warning("Index fetch (Tencent) failed: %s", exc)
 
     return "none", []
 
